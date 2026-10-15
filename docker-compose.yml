@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  anniexboda-cpp:
+    build: .
+    container_name: anniexboda_cpp_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    shm_size: "2gb"
+    volumes:
+      - ./td_db:/app/td_db
+      - ./cache:/app/cache

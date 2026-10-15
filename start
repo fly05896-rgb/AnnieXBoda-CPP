@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -e
+
+if [ ! -f "./build/annie_music_bot" ]; then
+    echo "⚙️ Binary not found, running ./build.sh first..."
+    bash ./build.sh
+fi
+
+echo "🚀 Starting AnnieXBoda C++20 Music Bot..."
+exec ./build/annie_music_bot
