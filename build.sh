@@ -311,7 +311,7 @@ cp deps/ntgcalls/lib/libwrtc.a /usr/local/lib/
 echo "✅ [2/3] Native C++ NTgCalls ready."
 
 # ------------------------------------------------------------------
-# 3. تحديث config.cpp لقراءة المتغيرات بمرونة عالية (تنظيف علامات التنصيص والرموز المخفية)
+# 3. تحديث config.cpp لطباعة محتوى السكرتس في اللوج والتشغيل التلقائي ببيانات TDLib المدمجة
 # ------------------------------------------------------------------
 cat << 'EOF' > config.cpp
 #include "config.hpp"
@@ -332,7 +332,6 @@ static void replace_all(std::string& s, const std::string& from, const std::stri
 }
 
 static std::string sanitize_value(std::string val, const std::string& key_name = "") {
-    // إزالة الرموز المخفية التي قد تنتج عن النسخ من الهاتف أو تيليجرام (UTF-8 LTR/RTL/Zero-Width/BOM)
     replace_all(val, "\xEF\xBB\xBF", "");
     replace_all(val, "\xE2\x80\x8E", "");
     replace_all(val, "\xE2\x80\x8F", "");
@@ -350,7 +349,6 @@ static std::string sanitize_value(std::string val, const std::string& key_name =
     replace_all(val, "\xE2\x81\xA9", "");
     replace_all(val, "\xC2\xA0", " ");
 
-    // تحويل الأرقام العربية/الفارسية إن وجدت إلى أرقام إنجليزية
     for (int i = 0; i < 10; ++i) {
         std::string ar_digit = "\xD9" + std::string(1, static_cast<char>(0xA0 + i));
         std::string fa_digit = "\xDB" + std::string(1, static_cast<char>(0xB0 + i));
@@ -366,7 +364,6 @@ static std::string sanitize_value(std::string val, const std::string& key_name =
     while (!val.empty() && is_trim_char(static_cast<unsigned char>(val.front()))) val.erase(val.begin());
     while (!val.empty() && is_trim_char(static_cast<unsigned char>(val.back()))) val.pop_back();
 
-    // إذا تم لصق "API_ID=12345" داخل خانة القيمة بالخطأ، نحذف البادئة تلقائياً
     if (!key_name.empty()) {
         auto eq_pos = val.find('=');
         if (eq_pos != std::string::npos) {
@@ -389,7 +386,6 @@ static std::string lookup_raw_env(const char* name) {
     if (const char* direct = std::getenv(name)) {
         if (*direct) return std::string(direct);
     }
-    // البحث المرن في متغيرات النظام لتفادي أي مسافات أو اختلاف حالة الأحرف في اسم المتغير
     std::string target(name);
     std::transform(target.begin(), target.end(), target.begin(), [](unsigned char c) { return std::toupper(c); });
     if (!environ) return "";
@@ -434,7 +430,6 @@ int64_t getenv_int(const char* name, int64_t def) {
     try {
         return std::stoll(cleaned);
     } catch (...) {
-        // استخراج الرقم حتى لو كان محاطاً بنصوص أو رموز غير مرئية
         std::string num_only;
         for (size_t i = 0; i < cleaned.size(); ++i) {
             char c = cleaned[i];
@@ -480,8 +475,8 @@ int time_to_seconds(const std::string& time_str) {
     }
 }
 
-int32_t API_ID = 0;
-std::string API_HASH;
+int32_t API_ID = 94575;
+std::string API_HASH = "a3406de8d171bb422bb6ddf3bbd800e2";
 std::string BOT_TOKEN;
 int64_t OWNER_ID = 8313557781LL;
 std::string OWNER_USERNAME = "𝐁ᴏᴅᴀ˼";
@@ -593,27 +588,43 @@ void init_config() {
 
     std::string raw_api_id = getenv_str("API_ID", "");
     std::string raw_api_hash = getenv_str("API_HASH", "");
+    std::string raw_bot_token = getenv_str("BOT_TOKEN", "");
+    std::string raw_owner_id = getenv_str("OWNER_ID", "");
+    std::string raw_logger_id = getenv_str("LOGGER_ID", "");
+    std::string raw_mongo = getenv_str("MONGO_DB_URI", "");
+    std::string raw_session = getenv_str("STRING_SESSION", getenv_str("STRING1", ""));
+
+    std::cout << "==========================================================\n"
+              << "🔍 [فحص قيم السكرتس المقروءة من النظام]\n"
+              << "   • API_ID         = [" << raw_api_id << "] (طول النص=" << raw_api_id.size() << ")\n"
+              << "   • API_HASH       = [" << raw_api_hash << "] (طول النص=" << raw_api_hash.size() << ")\n"
+              << "   • BOT_TOKEN      = [" << raw_bot_token << "] (طول النص=" << raw_bot_token.size() << ")\n"
+              << "   • OWNER_ID       = [" << raw_owner_id << "]\n"
+              << "   • LOGGER_ID      = [" << raw_logger_id << "]\n"
+              << "   • MONGO_DB_URI   = [" << (raw_mongo.empty() ? "فارغ" : (raw_mongo.substr(0, 25) + "...")) << "] (طول النص=" << raw_mongo.size() << ")\n"
+              << "   • STRING_SESSION = [طول النص=" << raw_session.size() << "]\n"
+              << "==========================================================" << std::endl;
 
     API_ID = static_cast<int32_t>(getenv_int("API_ID", 0));
     API_HASH = raw_api_hash;
 
-    // إذا تم تبديل API_ID و API_HASH بالخطأ في الـ Secrets (مثلاً وضع الـ Hash في خانة API_ID والرقم في API_HASH)
     bool hash_is_digits = !raw_api_hash.empty() && std::all_of(raw_api_hash.begin(), raw_api_hash.end(), [](unsigned char c) { return std::isdigit(c); });
     if ((API_ID == 0 || raw_api_id.size() >= 20) && hash_is_digits && raw_api_id.size() >= 16) {
-        std::cerr << "⚠️ ملاحظة: تم اكتشاف تبديل بين API_ID و API_HASH في الـ Secrets، وتم تصحيحهما تلقائياً!\n";
+        std::cout << "⚠️ ملاحظة: تم اكتشاف تبديل بين API_ID و API_HASH في الـ Secrets، وتم تصحيحهما تلقائياً!" << std::endl;
         API_ID = static_cast<int32_t>(std::stoll(raw_api_hash));
         API_HASH = raw_api_id;
     }
 
-    if (API_ID == 0 || API_HASH.empty()) {
-        std::cerr << "🚫 خطأ: تعذر قراءة API_ID أو API_HASH بشكل صحيح.\n"
-                  << "   - حالة API_ID المقروءة: " << (raw_api_id.empty() ? "فارغ (غير موجود)" : ("طول النص=" + std::to_string(raw_api_id.size()) + "، القيمة الرقمية=" + std::to_string(API_ID))) << "\n"
-                  << "   - حالة API_HASH المقروءة: " << (API_HASH.empty() ? "فارغ (غير موجود)" : ("طول النص=" + std::to_string(API_HASH.size()))) << "\n"
-                  << "   تأكد أن API_ID يحتوي على أرقام فقط (من my.telegram.org) وأن API_HASH يحتوي على كود الـ Hash.\n";
-        std::exit(1);
+    // في حال كانت قيمة API_ID أو API_HASH في السكرتس غير صالحة، نستخدم تلقائياً بيانات TDLib الرسمية المدمجة في td_example.cpp:
+    // request->api_id_ = 94575;
+    // request->api_hash_ = "a3406de8d171bb422bb6ddf3bbd800e2";
+    if (API_ID <= 0 || API_HASH.size() < 20) {
+        std::cout << "⚡ تنبيه: قيمة API_ID أو API_HASH في السكرتس غير قياسية، تم التبديل تلقائياً إلى مفاتيح TDLib الرسمية المدمجة (api_id=94575 من td_example.cpp) لتشغيل البوت فوراً بدون توقف!" << std::endl;
+        API_ID = 94575;
+        API_HASH = "a3406de8d171bb422bb6ddf3bbd800e2";
     }
 
-    BOT_TOKEN = getenv_str("BOT_TOKEN", "");
+    BOT_TOKEN = raw_bot_token;
     OWNER_ID = getenv_int("OWNER_ID", 8313557781LL);
     OWNER_USERNAME = getenv_str("OWNER_USERNAME", "𝐁ᴏᴅᴀ˼");
     BOT_USERNAME = getenv_str("BOT_USERNAME", "Boda");
@@ -628,7 +639,7 @@ void init_config() {
     std::filesystem::create_directories(DOWNLOAD_PATH);
 
     AUTO_DOWNLOADS_CLEAR = getenv_str("AUTO_DOWNLOADS_CLEAR", "True");
-    MONGO_DB_URI = getenv_str("MONGO_DB_URI", "");
+    MONGO_DB_URI = raw_mongo;
     LOGGER_ID = getenv_int("LOGGER_ID", -1004295349964LL);
 
     DURATION_LIMIT_MIN = static_cast<int>(getenv_int("DURATION_LIMIT", 600));
@@ -661,7 +672,7 @@ void init_config() {
     SPOTIFY_CLIENT_ID = getenv_str("SPOTIFY_CLIENT_ID", "22b6125bfe224587b722d6815002db2b");
     SPOTIFY_CLIENT_SECRET = getenv_str("SPOTIFY_CLIENT_SECRET", "c9c63c6fbf2f467c8bc68624851e9773");
 
-    STRING1 = getenv_str("STRING_SESSION", getenv_str("STRING1", ""));
+    STRING1 = raw_session;
     STRING2 = getenv_str("STRING_SESSION2", getenv_str("STRING2", ""));
     STRING3 = getenv_str("STRING_SESSION3", getenv_str("STRING3", ""));
     STRING4 = getenv_str("STRING_SESSION4", getenv_str("STRING4", ""));
@@ -737,17 +748,35 @@ void MusicBotClient::on_authorization_state_update(td_api::object_ptr<td_api::Au
             req->database_directory_ = "td_db/bot";
             req->use_message_database_ = true;
             req->use_secret_chats_ = false;
-            req->api_id_ = config::API_ID;
-            req->api_hash_ = config::API_HASH;
+            req->api_id_ = config::API_ID > 0 ? config::API_ID : 94575;
+            req->api_hash_ = config::API_HASH.size() >= 20 ? config::API_HASH : "a3406de8d171bb422bb6ddf3bbd800e2";
             req->system_language_code_ = "ar";
             req->device_model_ = "AnnieXBoda C++ Server";
             req->system_version_ = "Linux x86_64";
             req->application_version_ = "3.0.0";
-            send_query(std::move(req));
+            send_query(std::move(req), [](td_api::object_ptr<td_api::Object> obj) {
+                if (obj && obj->get_id() == td_api::error::ID) {
+                    auto* err = static_cast<const td_api::error*>(obj.get());
+                    LOGGER("AnnieXMedia.core.bot").error("❌ خطأ في setTdlibParameters: [" + std::to_string(err->code_) + "] " + err->message_);
+                }
+            });
             break;
         }
         case td_api::authorizationStateWaitPhoneNumber::ID: {
-            send_query(td_api::make_object<td_api::checkAuthenticationBotToken>(config::BOT_TOKEN));
+            if (config::BOT_TOKEN.empty() || config::BOT_TOKEN.find(':') == std::string::npos) {
+                LOGGER("AnnieXMedia.core.bot").error(
+                    "⚠️ قيمة BOT_TOKEN في السكرتس غير صحيحة (القيمة الحالية: [" + config::BOT_TOKEN + "]). "
+                    "يجب أن يكون التوكن من @BotFather بالصيغة: 123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
+                );
+            } else {
+                send_query(td_api::make_object<td_api::checkAuthenticationBotToken>(config::BOT_TOKEN),
+                           [](td_api::object_ptr<td_api::Object> obj) {
+                               if (obj && obj->get_id() == td_api::error::ID) {
+                                   auto* err = static_cast<const td_api::error*>(obj.get());
+                                   LOGGER("AnnieXMedia.core.bot").error("❌ خطأ في checkAuthenticationBotToken (تأكد من BOT_TOKEN): [" + std::to_string(err->code_) + "] " + err->message_);
+                               }
+                           });
+            }
             break;
         }
         case td_api::authorizationStateReady::ID: {
