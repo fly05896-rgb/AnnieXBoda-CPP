@@ -10,12 +10,21 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 # ------------------------------------------------------------------
-# 1. إصلاح ملف third_party/td/CMakeLists.txt وبناء مكتبة TDLib
+# 1. إصلاح ملفات CMakeLists.txt الخاصة بـ TDLib وبناء المكتبة
 # ------------------------------------------------------------------
+echo "🔧 Patching TDLib CMakeLists.txt files (removing missing test & benchmark targets)..."
+mkdir -p third_party/td/test
+if [ ! -f "third_party/td/test/main.cpp" ]; then
+    echo "int main() { return 0; }" > third_party/td/test/main.cpp
+fi
+
 if [ -f "third_party/td/CMakeLists.txt" ]; then
-    echo "🔧 Patching third_party/td/CMakeLists.txt (removing missing test & benchmark dirs)..."
     sed -i 's/add_subdirectory(test)/# add_subdirectory(test)/g' third_party/td/CMakeLists.txt
     sed -i 's/add_subdirectory(benchmark)/# add_subdirectory(benchmark)/g' third_party/td/CMakeLists.txt
+fi
+
+if [ -f "third_party/td/tde2e/CMakeLists.txt" ]; then
+    sed -i '/add_executable(test-e2e/,/target_include_directories(test-e2e/d' third_party/td/tde2e/CMakeLists.txt
 fi
 
 if [ ! -f "/usr/local/lib/libtdclient.a" ] && [ -d "third_party/td" ]; then
