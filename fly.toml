@@ -1,3 +1,8 @@
+# fly.toml app configuration file generated for anniexboda-cpp on 2026-10-16T10:49:57Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
 app = 'anniexboda-cpp'
 primary_region = 'fra'
 
