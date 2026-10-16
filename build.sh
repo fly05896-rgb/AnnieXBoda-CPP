@@ -311,7 +311,378 @@ cp deps/ntgcalls/lib/libwrtc.a /usr/local/lib/
 echo "✅ [2/3] Native C++ NTgCalls ready."
 
 # ------------------------------------------------------------------
-# 3. تحديث توافق TDLib 1.8.63 في AnnieXMedia/core/bot.cpp و CMakeLists.txt
+# 3. تحديث config.cpp لقراءة المتغيرات بمرونة عالية (تنظيف علامات التنصيص والرموز المخفية)
+# ------------------------------------------------------------------
+cat << 'EOF' > config.cpp
+#include "config.hpp"
+#include <algorithm>
+#include <cctype>
+
+extern char **environ;
+
+namespace config {
+
+static void replace_all(std::string& s, const std::string& from, const std::string& to) {
+    if (from.empty()) return;
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.length(), to);
+        pos += to.length();
+    }
+}
+
+static std::string sanitize_value(std::string val, const std::string& key_name = "") {
+    // إزالة الرموز المخفية التي قد تنتج عن النسخ من الهاتف أو تيليجرام (UTF-8 LTR/RTL/Zero-Width/BOM)
+    replace_all(val, "\xEF\xBB\xBF", "");
+    replace_all(val, "\xE2\x80\x8E", "");
+    replace_all(val, "\xE2\x80\x8F", "");
+    replace_all(val, "\xE2\x80\x8B", "");
+    replace_all(val, "\xE2\x80\x8C", "");
+    replace_all(val, "\xE2\x80\x8D", "");
+    replace_all(val, "\xE2\x80\xAA", "");
+    replace_all(val, "\xE2\x80\xAB", "");
+    replace_all(val, "\xE2\x80\xAC", "");
+    replace_all(val, "\xE2\x80\xAD", "");
+    replace_all(val, "\xE2\x80\xAE", "");
+    replace_all(val, "\xE2\x81\xA6", "");
+    replace_all(val, "\xE2\x81\xA7", "");
+    replace_all(val, "\xE2\x81\xA8", "");
+    replace_all(val, "\xE2\x81\xA9", "");
+    replace_all(val, "\xC2\xA0", " ");
+
+    // تحويل الأرقام العربية/الفارسية إن وجدت إلى أرقام إنجليزية
+    for (int i = 0; i < 10; ++i) {
+        std::string ar_digit = "\xD9" + std::string(1, static_cast<char>(0xA0 + i));
+        std::string fa_digit = "\xDB" + std::string(1, static_cast<char>(0xB0 + i));
+        std::string en_digit(1, static_cast<char>('0' + i));
+        replace_all(val, ar_digit, en_digit);
+        replace_all(val, fa_digit, en_digit);
+    }
+
+    auto is_trim_char = [](unsigned char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '"' || c == '\'' || c == '`';
+    };
+
+    while (!val.empty() && is_trim_char(static_cast<unsigned char>(val.front()))) val.erase(val.begin());
+    while (!val.empty() && is_trim_char(static_cast<unsigned char>(val.back()))) val.pop_back();
+
+    // إذا تم لصق "API_ID=12345" داخل خانة القيمة بالخطأ، نحذف البادئة تلقائياً
+    if (!key_name.empty()) {
+        auto eq_pos = val.find('=');
+        if (eq_pos != std::string::npos) {
+            std::string prefix = val.substr(0, eq_pos);
+            while (!prefix.empty() && is_trim_char(static_cast<unsigned char>(prefix.front()))) prefix.erase(prefix.begin());
+            while (!prefix.empty() && is_trim_char(static_cast<unsigned char>(prefix.back()))) prefix.pop_back();
+            if (prefix == key_name) {
+                val = val.substr(eq_pos + 1);
+                while (!val.empty() && is_trim_char(static_cast<unsigned char>(val.front()))) val.erase(val.begin());
+                while (!val.empty() && is_trim_char(static_cast<unsigned char>(val.back()))) val.pop_back();
+            }
+        }
+    }
+
+    return val;
+}
+
+static std::string lookup_raw_env(const char* name) {
+    if (!name || !*name) return "";
+    if (const char* direct = std::getenv(name)) {
+        if (*direct) return std::string(direct);
+    }
+    // البحث المرن في متغيرات النظام لتفادي أي مسافات أو اختلاف حالة الأحرف في اسم المتغير
+    std::string target(name);
+    std::transform(target.begin(), target.end(), target.begin(), [](unsigned char c) { return std::toupper(c); });
+    if (!environ) return "";
+    for (char **env = environ; *env != nullptr; ++env) {
+        std::string entry(*env);
+        auto eq = entry.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = sanitize_value(entry.substr(0, eq));
+        std::transform(k.begin(), k.end(), k.begin(), [](unsigned char c) { return std::toupper(c); });
+        if (k == target) {
+            return entry.substr(eq + 1);
+        }
+    }
+    return "";
+}
+
+void load_dotenv(const std::string& path) {
+    std::ifstream file(path);
+    if (!file.is_open()) return;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        auto pos = line.find('=');
+        if (pos == std::string::npos) continue;
+        std::string key = sanitize_value(line.substr(0, pos));
+        std::string val = sanitize_value(line.substr(pos + 1), key);
+        if (!key.empty() && !val.empty()) {
+            setenv(key.c_str(), val.c_str(), 0);
+        }
+    }
+}
+
+std::string getenv_str(const char* name, const std::string& def) {
+    std::string raw = lookup_raw_env(name);
+    std::string cleaned = sanitize_value(raw, name ? name : "");
+    return !cleaned.empty() ? cleaned : def;
+}
+
+int64_t getenv_int(const char* name, int64_t def) {
+    std::string cleaned = getenv_str(name, "");
+    if (cleaned.empty()) return def;
+    try {
+        return std::stoll(cleaned);
+    } catch (...) {
+        // استخراج الرقم حتى لو كان محاطاً بنصوص أو رموز غير مرئية
+        std::string num_only;
+        for (size_t i = 0; i < cleaned.size(); ++i) {
+            char c = cleaned[i];
+            if (c == '-' && num_only.empty() && i + 1 < cleaned.size() && std::isdigit(static_cast<unsigned char>(cleaned[i + 1]))) {
+                num_only.push_back(c);
+            } else if (std::isdigit(static_cast<unsigned char>(c))) {
+                num_only.push_back(c);
+            } else if (!num_only.empty()) {
+                break;
+            }
+        }
+        if (!num_only.empty() && num_only != "-") {
+            try {
+                return std::stoll(num_only);
+            } catch (...) {}
+        }
+        return def;
+    }
+}
+
+bool getenv_bool(const char* name, bool def) {
+    std::string val = getenv_str(name, def ? "True" : "False");
+    return (val == "1" || val == "true" || val == "True" || val == "TRUE" || val == "yes" || val == "on");
+}
+
+int time_to_seconds(const std::string& time_str) {
+    try {
+        std::vector<int> parts;
+        std::stringstream ss(time_str);
+        std::string item;
+        while (std::getline(ss, item, ':')) {
+            parts.push_back(std::stoi(item));
+        }
+        int total = 0;
+        int mult = 1;
+        for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+            total += (*it) * mult;
+            mult *= 60;
+        }
+        return total;
+    } catch (...) {
+        return 0;
+    }
+}
+
+int32_t API_ID = 0;
+std::string API_HASH;
+std::string BOT_TOKEN;
+int64_t OWNER_ID = 8313557781LL;
+std::string OWNER_USERNAME = "𝐁ᴏᴅᴀ˼";
+std::string BOT_USERNAME = "Boda";
+std::string BOT_NAME = "˹𝚂ᴏᴜʀᴄᴇ ✘ 𝐁ᴏᴅᴀ˼ ♪";
+std::string ASSUSERNAME = "S_G0C7";
+std::string DOWNLOAD_PATH = "/dev/shm/AnnieDownloads";
+std::string AUTO_DOWNLOADS_CLEAR = "True";
+std::string MONGO_DB_URI;
+int64_t LOGGER_ID = -1004295349964LL;
+int DURATION_LIMIT_MIN = 600;
+int DURATION_LIMIT = 36000;
+int SONG_DOWNLOAD_DURATION = 3600;
+int SONG_DOWNLOAD_DURATION_LIMIT = 5400;
+int64_t TG_AUDIO_FILESIZE_LIMIT = 2147483648LL;
+int64_t TG_VIDEO_FILESIZE_LIMIT = 2147483648LL;
+int PLAYLIST_FETCH_LIMIT = 100;
+int AI_HANDLER_GROUP = 30;
+int SERVER_PLAYLIST_LIMIT = 30;
+std::string COOKIE_URL;
+std::string API_URL = "https://hyperionengine.fly.dev";
+std::string VIDEO_API_URL = "https://hyperionengine.fly.dev";
+std::string API_KEY;
+std::string DEEP_API;
+std::string AI_API_KEY;
+std::string HEROKU_APP_NAME;
+std::string HEROKU_API_KEY;
+std::string UPSTREAM_REPO = "https://t.me/SourceBoda";
+std::string UPSTREAM_BRANCH = "Master";
+std::string GIT_TOKEN;
+std::string SUPPORT_CHANNEL = "https://t.me/SourceBoda";
+std::string SUPPORT_CHAT = "https://t.me/music0587";
+std::string AUTO_LEAVING_ASSISTANT = "False";
+int AUTO_LEAVE_ASSISTANT_TIME = 3600;
+bool AUTO_END = false;
+bool DEBUG_IGNORE_LOG = true;
+std::string SPOTIFY_CLIENT_ID = "22b6125bfe224587b722d6815002db2b";
+std::string SPOTIFY_CLIENT_SECRET = "c9c63c6fbf2f467c8bc68624851e9773";
+std::string STRING1;
+std::string STRING2;
+std::string STRING3;
+std::string STRING4;
+std::string STRING5;
+
+std::vector<std::string> START_VIDS = {
+    "https://files.catbox.moe/b6533n.jpg",
+    "https://files.catbox.moe/wqipfn.jpg",
+    "https://files.catbox.moe/efzuds.jpg",
+};
+
+std::vector<std::string> STICKERS = {
+    "CAACAgQAAyEFAATHCHTJAAIToGlfMcgnOpNnuYnm1hlBTW_pZgZfAAIfFgAC-CS4UbtZNHZyyA3BHgQ",
+    "CAACAgUAAyEFAATHCHTJAAITn2lfMb5VpY0QAom50knojYHju4bTAAILFQAC-vEZVMBmWHCQ-sJuHgQ",
+};
+
+std::string UNIFIED_IMG = "https://files.catbox.moe/ompn1o.jpg";
+std::string START_IMG_URL = UNIFIED_IMG;
+std::string HELP_IMG_URL = UNIFIED_IMG;
+std::string PING_VID_URL = UNIFIED_IMG;
+std::string PLAYLIST_IMG_URL = UNIFIED_IMG;
+std::string STATS_VID_URL = UNIFIED_IMG;
+std::string TELEGRAM_AUDIO_URL = UNIFIED_IMG;
+std::string TELEGRAM_VIDEO_URL = UNIFIED_IMG;
+std::string STREAM_IMG_URL = UNIFIED_IMG;
+std::string SOUNCLOUD_IMG_URL = UNIFIED_IMG;
+std::string YOUTUBE_IMG_URL = UNIFIED_IMG;
+std::string SPOTIFY_ARTIST_IMG_URL = UNIFIED_IMG;
+std::string SPOTIFY_ALBUM_IMG_URL = UNIFIED_IMG;
+std::string SPOTIFY_PLAYLIST_IMG_URL = UNIFIED_IMG;
+
+std::vector<std::string> AYU = {
+    "جـاري الـتـشـغـيـل .. 🤍",
+    "جـاري الـتـحـمـيـل .. 🫶",
+    "لـحـظـة مـن فـضـلـك .. 🤍",
+    "طـلـبـك قـيـد الـتـنـفـيـذ .. ☔",
+    "يـتـم تـشـغـيـل الـتـراك .. 💝"
+};
+
+std::vector<std::string> AYUV = {
+    "صـلـي عـلـي الـنـبـي وتـبـسـم 🤍🌿.\n"
+    "مـرحـبـا انـا بـوت تـشـغـيـل صوتيات متطور ☔\n"
+    "أهـلاً بـك عـزيـزي {0} 🫶\n"
+    "وظـيـفـتـي تـشـغـيـل الـمـيـديـا فـي الـمـكـالـمـات بـجـودة عـالـيـة وبـدون تـقـطـيـع 🤍.\n"
+    "⧉ لـتـشـغـيـل أغـنـيـة اكـتـب « تشغيل + اسم الاغنية »\n"
+    "⧉ لـلـتـحـكـم فـي الـبـوت اضـغـط « الأوامـر » بـالأسـفـل 💝.\n"
+    "ـــــــــــــــــــــــــــــــــــــــــــــــــــــــ\n"
+    "⧉ وقـت الـعـمـل : {2}\n"
+    "⧉ الـرام : {5}\n"
+    "ـــــــــــــــــــــــــــــــــــــــــــــــــــــــ",
+    "صـلـي عـلـي الـنـبـي وتـبـسـم 🤍🌿.\n"
+    "مـرحـبـا انـا بـوت تـشـغـيـل صوتيات متطور ☔\n"
+    "أهـلاً بـكـم فـي {0} 🫶\n"
+    "أنـا {1} .. جـاهـز لـخـدمـتـكـم 🤍.\n"
+    "⧉ أعـمـل بـكـفـاءة عـالـيـة بـدون تـوقـف.\n"
+    "⧉ فـقـط أضـفـنـي لـمـجـمـوعـتـك وارفـعـنـي مـشـرف 💝.\n"
+    "⧉ وقـت الـتـشـغـيـل : {2}"
+};
+
+std::unordered_set<int64_t> BANNED_USERS;
+std::unordered_map<int64_t, std::vector<int64_t>> adminlist;
+std::unordered_map<std::string, std::string> lyrical;
+std::vector<std::string> autoclean;
+std::unordered_map<int64_t, std::unordered_map<std::string, std::string>> confirmer;
+std::mutex runtime_mutex;
+
+void init_config() {
+    load_dotenv(".env");
+    load_dotenv("/app/.env");
+
+    std::string raw_api_id = getenv_str("API_ID", "");
+    std::string raw_api_hash = getenv_str("API_HASH", "");
+
+    API_ID = static_cast<int32_t>(getenv_int("API_ID", 0));
+    API_HASH = raw_api_hash;
+
+    // إذا تم تبديل API_ID و API_HASH بالخطأ في الـ Secrets (مثلاً وضع الـ Hash في خانة API_ID والرقم في API_HASH)
+    bool hash_is_digits = !raw_api_hash.empty() && std::all_of(raw_api_hash.begin(), raw_api_hash.end(), [](unsigned char c) { return std::isdigit(c); });
+    if ((API_ID == 0 || raw_api_id.size() >= 20) && hash_is_digits && raw_api_id.size() >= 16) {
+        std::cerr << "⚠️ ملاحظة: تم اكتشاف تبديل بين API_ID و API_HASH في الـ Secrets، وتم تصحيحهما تلقائياً!\n";
+        API_ID = static_cast<int32_t>(std::stoll(raw_api_hash));
+        API_HASH = raw_api_id;
+    }
+
+    if (API_ID == 0 || API_HASH.empty()) {
+        std::cerr << "🚫 خطأ: تعذر قراءة API_ID أو API_HASH بشكل صحيح.\n"
+                  << "   - حالة API_ID المقروءة: " << (raw_api_id.empty() ? "فارغ (غير موجود)" : ("طول النص=" + std::to_string(raw_api_id.size()) + "، القيمة الرقمية=" + std::to_string(API_ID))) << "\n"
+                  << "   - حالة API_HASH المقروءة: " << (API_HASH.empty() ? "فارغ (غير موجود)" : ("طول النص=" + std::to_string(API_HASH.size()))) << "\n"
+                  << "   تأكد أن API_ID يحتوي على أرقام فقط (من my.telegram.org) وأن API_HASH يحتوي على كود الـ Hash.\n";
+        std::exit(1);
+    }
+
+    BOT_TOKEN = getenv_str("BOT_TOKEN", "");
+    OWNER_ID = getenv_int("OWNER_ID", 8313557781LL);
+    OWNER_USERNAME = getenv_str("OWNER_USERNAME", "𝐁ᴏᴅᴀ˼");
+    BOT_USERNAME = getenv_str("BOT_USERNAME", "Boda");
+    BOT_NAME = getenv_str("BOT_NAME", "˹𝚂ᴏᴜʀᴄᴇ ✘ 𝐁ᴏᴅᴀ˼ ♪");
+    ASSUSERNAME = getenv_str("ASSUSERNAME", "S_G0C7");
+
+    if (std::filesystem::exists("/dev/shm")) {
+        DOWNLOAD_PATH = "/dev/shm/AnnieDownloads";
+    } else {
+        DOWNLOAD_PATH = "downloads";
+    }
+    std::filesystem::create_directories(DOWNLOAD_PATH);
+
+    AUTO_DOWNLOADS_CLEAR = getenv_str("AUTO_DOWNLOADS_CLEAR", "True");
+    MONGO_DB_URI = getenv_str("MONGO_DB_URI", "");
+    LOGGER_ID = getenv_int("LOGGER_ID", -1004295349964LL);
+
+    DURATION_LIMIT_MIN = static_cast<int>(getenv_int("DURATION_LIMIT", 600));
+    DURATION_LIMIT = time_to_seconds(std::to_string(DURATION_LIMIT_MIN) + ":00");
+    SONG_DOWNLOAD_DURATION = static_cast<int>(getenv_int("SONG_DOWNLOAD_DURATION", 3600));
+    SONG_DOWNLOAD_DURATION_LIMIT = static_cast<int>(getenv_int("SONG_DOWNLOAD_DURATION_LIMIT", 5400));
+    TG_AUDIO_FILESIZE_LIMIT = getenv_int("TG_AUDIO_FILESIZE_LIMIT", 2147483648LL);
+    TG_VIDEO_FILESIZE_LIMIT = getenv_int("TG_VIDEO_FILESIZE_LIMIT", 2147483648LL);
+    PLAYLIST_FETCH_LIMIT = static_cast<int>(getenv_int("PLAYLIST_FETCH_LIMIT", 100));
+    AI_HANDLER_GROUP = static_cast<int>(getenv_int("AI_HANDLER_GROUP", 30));
+    SERVER_PLAYLIST_LIMIT = static_cast<int>(getenv_int("SERVER_PLAYLIST_LIMIT", 30));
+
+    COOKIE_URL = getenv_str("COOKIE_URL", "");
+    API_URL = getenv_str("API_URL", "https://hyperionengine.fly.dev");
+    VIDEO_API_URL = getenv_str("VIDEO_API_URL", "https://hyperionengine.fly.dev");
+    API_KEY = getenv_str("API_KEY", "");
+    DEEP_API = getenv_str("DEEP_API", "");
+    AI_API_KEY = getenv_str("GPT_4", "");
+
+    HEROKU_APP_NAME = getenv_str("HEROKU_APP_NAME", "");
+    HEROKU_API_KEY = getenv_str("HEROKU_API_KEY", "");
+    UPSTREAM_REPO = getenv_str("UPSTREAM_REPO", "https://t.me/SourceBoda");
+    UPSTREAM_BRANCH = getenv_str("UPSTREAM_BRANCH", "Master");
+    GIT_TOKEN = getenv_str("GIT_TOKEN", "");
+    SUPPORT_CHANNEL = getenv_str("SUPPORT_CHANNEL", "https://t.me/SourceBoda");
+    SUPPORT_CHAT = getenv_str("SUPPORT_CHAT", "https://t.me/music0587");
+
+    AUTO_LEAVING_ASSISTANT = getenv_str("AUTO_LEAVING_ASSISTANT", "False");
+    AUTO_LEAVE_ASSISTANT_TIME = static_cast<int>(getenv_int("ASSISTANT_LEAVE_TIME", 3600));
+    SPOTIFY_CLIENT_ID = getenv_str("SPOTIFY_CLIENT_ID", "22b6125bfe224587b722d6815002db2b");
+    SPOTIFY_CLIENT_SECRET = getenv_str("SPOTIFY_CLIENT_SECRET", "c9c63c6fbf2f467c8bc68624851e9773");
+
+    STRING1 = getenv_str("STRING_SESSION", getenv_str("STRING1", ""));
+    STRING2 = getenv_str("STRING_SESSION2", getenv_str("STRING2", ""));
+    STRING3 = getenv_str("STRING_SESSION3", getenv_str("STRING3", ""));
+    STRING4 = getenv_str("STRING_SESSION4", getenv_str("STRING4", ""));
+    STRING5 = getenv_str("STRING_SESSION5", getenv_str("STRING5", ""));
+
+    std::regex url_re("^https?://");
+    if (!SUPPORT_CHANNEL.empty() && !std::regex_search(SUPPORT_CHANNEL, url_re)) {
+        if (SUPPORT_CHANNEL[0] == '@') SUPPORT_CHANNEL.erase(SUPPORT_CHANNEL.begin());
+        SUPPORT_CHANNEL = "https://t.me/" + SUPPORT_CHANNEL;
+    }
+    if (!SUPPORT_CHAT.empty() && !std::regex_search(SUPPORT_CHAT, url_re)) {
+        if (SUPPORT_CHAT[0] == '@') SUPPORT_CHAT.erase(SUPPORT_CHAT.begin());
+        SUPPORT_CHAT = "https://t.me/" + SUPPORT_CHAT;
+    }
+}
+
+} // namespace config
+EOF
+
+# ------------------------------------------------------------------
+# 4. تحديث توافق TDLib 1.8.63 في AnnieXMedia/core/bot.cpp و main.cpp و CMakeLists.txt
 # ------------------------------------------------------------------
 cat << 'EOF' > AnnieXMedia/core/bot.cpp
 #include "AnnieXMedia/core/bot.hpp"
@@ -1060,6 +1431,135 @@ std::string MusicBotClient::download_file(const std::string& remote_file_id) {
 } // namespace AnnieXMedia::core
 EOF
 
+cat << 'EOF' > AnnieXMedia/main.cpp
+// ── 𝚂ᴏᴜʀᴄᴇ ✘ 𝐁ᴏᴅᴀ © 2026 (C++20 Edition - TDLib & Native NTgCalls) ──────────
+#include "config.hpp"
+#include "strings/strings.hpp"
+#include "AnnieXMedia/logging.hpp"
+#include "AnnieXMedia/misc.hpp"
+#include "AnnieXMedia/core/bot.hpp"
+#include "AnnieXMedia/core/call.hpp"
+#include "AnnieXMedia/core/dir.hpp"
+#include "AnnieXMedia/core/git.hpp"
+#include "AnnieXMedia/core/mongo.hpp"
+#include "AnnieXMedia/core/userbot.hpp"
+#include "AnnieXMedia/plugins/plugin_manager.hpp"
+#include "AnnieXMedia/utils/cookie_handler.hpp"
+#include "AnnieXMedia/utils/database.hpp"
+
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <thread>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+using namespace AnnieXMedia;
+
+static void start_healthcheck_server() {
+    std::thread([]() {
+        int port = static_cast<int>(config::getenv_int("PORT", 8080));
+        int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (server_fd < 0) return;
+        int opt = 1;
+        ::setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(static_cast<uint16_t>(port));
+        if (::bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+            ::close(server_fd);
+            return;
+        }
+        ::listen(server_fd, 8);
+        const char* resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+        while (true) {
+            int client_fd = ::accept(server_fd, nullptr, nullptr);
+            if (client_fd < 0) continue;
+            char buf[256];
+            (void)::read(client_fd, buf, sizeof(buf));
+            (void)::write(client_fd, resp, std::strlen(resp));
+            ::close(client_fd);
+        }
+    }).detach();
+}
+
+static void signal_handler(int signum) {
+    (void)signum;
+    LOGGER("AnnieXMedia").info("🛑 Bot process killed by user (SIGINT/SIGTERM). Stopping services...");
+    core::app.stop();
+    core::userbot.stop();
+    std::exit(0);
+}
+
+int main() {
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+
+    // تشغيل خادم الفحص الصحي على المنفذ 8080 ليتوافق مع Fly.io Proxy
+    start_healthcheck_server();
+
+    if (config::getenv_str("DEBUG_NTG", "0") == "1") {
+        std::cout << "🚨 تم تفعيل وضع الـ DEBUG لمكتبة ntgcalls C++ بناءً على طلبك من الكونسول 🚨" << std::endl;
+    }
+
+    // 1. Load configuration (.env) and language strings
+    config::init_config();
+    strings::init_strings("strings/langs");
+
+    // 2. Initialize directories, git, MongoDB, in-memory DB, and Heroku checks
+    core::StorageManager();
+    core::git();
+    core::init_mongo();
+    dbb();
+    heroku();
+
+    LOGGER("AnnieXMedia").info("🚀 Starting Annie Music Bot (C++20 Native TDLib & NTgCalls Engine)...");
+
+    if (config::STRING1.empty() && config::STRING2.empty() && config::STRING3.empty() &&
+        config::STRING4.empty() && config::STRING5.empty()) {
+        LOGGER("AnnieXMedia").warning("⚠️ لم يتم وضع STRING_SESSION، سيعمل البوت الأساسي بدون حساب مساعد لحين إضافته.");
+    }
+
+    // 3. Load YouTube cookies if COOKIE_URL is provided
+    try {
+        utils::fetch_and_store_cookies();
+    } catch (const std::exception& e) {
+        LOGGER("AnnieXMedia").warning(std::string("⚠️ Cookie Error: ") + e.what());
+    }
+
+    // 4. Load sudoers and banned/gbanned users
+    sudo();
+    for (auto uid : utils::database::get_gbanned()) {
+        config::BANNED_USERS.insert(uid);
+    }
+    for (auto uid : utils::database::get_banned_users()) {
+        config::BANNED_USERS.insert(uid);
+    }
+
+    // 5. Start TDLib Bot Client & register all C++ plugins
+    core::app.start();
+    plugins::register_all_plugins();
+
+    // 6. Start TDLib Assistant Userbots & Native C++ NTgCalls StreamController
+    core::userbot.start();
+    core::StreamController.start();
+    core::StreamController.decorators();
+
+    LOGGER("AnnieXMedia").info("✅ Annie Music Bot (C++20) Started Successfully.");
+
+    // 7. Block until interrupted
+    core::app.idle();
+
+    core::app.stop();
+    core::userbot.stop();
+    LOGGER("AnnieXMedia").info("🛑 Stopping Annie Music Bot...");
+    return 0;
+}
+EOF
+
 cat << 'EOF' > CMakeLists.txt
 cmake_minimum_required(VERSION 3.22)
 project(AnnieXBodaCPP VERSION 3.0.0 LANGUAGES C CXX)
@@ -1141,7 +1641,7 @@ target_link_libraries(annie_music_bot PRIVATE
 EOF
 
 # ------------------------------------------------------------------
-# 4. ترجمة وبناء البوت النهائي (annie_music_bot)
+# 5. ترجمة وبناء البوت النهائي (annie_music_bot)
 # ------------------------------------------------------------------
 echo "⚙️ [3/3] Compiling AnnieXBoda C++20 Bot executable..."
 rm -rf build
