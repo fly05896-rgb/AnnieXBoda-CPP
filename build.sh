@@ -9,7 +9,7 @@ JOBS=$(nproc 2>/dev/null || echo 4)
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-# محاولة تثبيت مكتبة pymongo اختيارياً لحفظ جلسة TDLib في MongoDB تلقائياً عبر عمليات الـ Deploy
+# تثبيت مكتبة pymongo اختيارياً لحفظ جلسة TDLib في MongoDB تلقائياً
 (apt-get update && apt-get install -y --no-install-recommends python3-pymongo python3-dnspython) >/dev/null 2>&1 || true
 
 # إنشاء أداة مزامنة وحفظ جلسة المساعد في MongoDB حتى لا يطلب كود تفعيل عند إعادة التشغيل أو الـ Deploy
@@ -724,7 +724,7 @@ void init_config() {
 
     HEROKU_APP_NAME = getenv_str("HEROKU_APP_NAME", "");
     HEROKU_API_KEY = getenv_str("HEROKU_API_KEY", "");
-    UPSTREAM_REPO = getenv_str("UPSTREAM_REPO", "https://t.me/SourceBoda";
+    UPSTREAM_REPO = getenv_str("UPSTREAM_REPO", "https://t.me/SourceBoda");
     UPSTREAM_BRANCH = getenv_str("UPSTREAM_BRANCH", "Master");
     GIT_TOKEN = getenv_str("GIT_TOKEN", "");
     SUPPORT_CHANNEL = getenv_str("SUPPORT_CHANNEL", "https://t.me/SourceBoda");
@@ -773,7 +773,6 @@ namespace AnnieXMedia::core {
 
 MusicBotClient app;
 
-// إرسال احتياطي عبر HTTP Bot API في حال كانت قاعدة بيانات TDLib المحلية جديدة ولم تتعرف على الجروب بعد
 static bool send_via_bot_api_http_single(int64_t target_chat_id, const std::string& html_text,
                                          int64_t reply_to_message_id, bool disable_preview) {
     if (config::BOT_TOKEN.empty()) return false;
@@ -811,7 +810,6 @@ static bool send_via_bot_api_http(int64_t chat_id, const std::string& html_text,
     if (send_via_bot_api_http_single(chat_id, html_text, reply_to_message_id, disable_preview)) {
         return true;
     }
-    // إذا كان LOGGER_ID مكتوباً بصيغة -1004295349964 بينما الجروب الأساسي العادي هو -4295349964 (بدون 100)
     if (chat_id < -1000000000000LL) {
         int64_t basic_group_chat_id = -((-chat_id) - 1000000000000LL);
         if (send_via_bot_api_http_single(basic_group_chat_id, html_text, reply_to_message_id, disable_preview)) {
@@ -1168,7 +1166,6 @@ int64_t MusicBotClient::send_message(int64_t chat_id, const std::string& text,
                                      const InlineKeyboardMarkup& reply_markup,
                                      int64_t reply_to_message_id,
                                      bool disable_web_page_preview) {
-    // محاولة تهيئة الشات في قاعدة بيانات TDLib المحلية أولاً
     if (chat_id > 0) {
         send_query(td_api::make_object<td_api::createPrivateChat>(chat_id, true));
     } else if (chat_id < -1000000000000LL) {
@@ -1201,7 +1198,6 @@ int64_t MusicBotClient::send_message(int64_t chat_id, const std::string& text,
         return static_cast<const td_api::message*>(resp.get())->id_;
     }
 
-    // في حال كانت الجلسة جديدة ولم يتعرف TDLib على الشات بعد، نرسل فوراً عبر Bot API HTTP
     if (send_via_bot_api_http(chat_id, text, reply_to_message_id, disable_web_page_preview)) {
         return 1;
     }
@@ -1595,7 +1591,6 @@ EOF
 
 # ------------------------------------------------------------------
 # 5. تحديث AnnieXMedia/core/userbot.hpp و AnnieXMedia/core/userbot.cpp
-#    بحيث لا يكتب "تم تشغيل المساعد" إلا بعد اكتمال تسجيل الدخول الفعلي ويرسل تنبيهاً في جروب السجل
 # ------------------------------------------------------------------
 cat << 'EOF' > AnnieXMedia/core/userbot.hpp
 #pragma once
@@ -1633,6 +1628,7 @@ class AssistantClient {
     std::atomic<bool> waiting_code_{false};
     std::atomic<bool> waiting_password_{false};
     std::atomic<bool> finalized_{false};
+    std::string password_hint_;
     std::mutex mtx_;
     std::map<uint64_t, std::function<void(td_api::object_ptr<td_api::Object>)>> callbacks_;
     std::map<int64_t, int32_t> chat_group_call_ids_;
@@ -1660,6 +1656,10 @@ public:
     bool is_authorized() const { return authorized_.load(); }
     bool is_waiting_code() const { return waiting_code_.load(); }
     bool is_waiting_password() const { return waiting_password_.load(); }
+    std::string get_password_hint() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return password_hint_;
+    }
 
     int32_t get_or_create_group_call_id(int64_t chat_id, bool auto_create = true);
     std::string join_group_call_signaling(int64_t chat_id, const std::string& join_payload_json,
@@ -1773,10 +1773,8 @@ void AssistantClient::finalize_authorization() {
         "☔ تم تشغيل المساعد " + std::to_string(index_) + " بنجاح بهوية: " + name + " (@" + username + ") [ID: " + std::to_string(id) + "]"
     );
 
-    // حفظ جلسة TDLib في MongoDB تلقائياً حتى لا يطلب كود تفعيل مرة أخرى عند عمل Deploy جديد
-    std::system("python3 /usr/local/bin/td_session_sync.py backup >/dev/null 2>&1 &");
+    if (std::system("python3 /usr/local/bin/td_session_sync.py backup >/dev/null 2>&1 &") != 0) {}
 
-    // إرسال رسالة تأكيد تشغيل المساعد في جروب السجل (LOGGER_ID) عبر البوت وعبر المساعد نفسه
     std::string log_msg =
         "<u><b>☔ تم تشغيل الحساب المساعد " + std::to_string(index_) + " بنجاح :</b></u>\n\n"
         "• <b>الاسم :</b> " + name + "\n"
@@ -1822,13 +1820,13 @@ void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationStat
                                    LOGGER("AnnieXMedia.core.userbot").error("❌ خطأ في رقم هاتف المساعد: " + err->message_);
                                    app.send_message(config::LOGGER_ID,
                                        "❌ <b>خطأ في رقم هاتف الحساب المساعد (" + phone_env + "):</b>\n<code>" + err->message_ + "</code>\n"
-                                       "أرسل الرقم الصحيح في شات البوت بالأمر:\n<code>/assphone +201xxxxxxxxx</code>");
+                                       "أرسل الرقم الصحيح في شات البوت بالأمر:\n<code>رقم المساعد +201xxxxxxxxx</code>");
                                }
                            });
             } else {
                 LOGGER("AnnieXMedia.core.userbot").warning(
                     "💝 المساعد " + std::to_string(index_) +
-                    ": أرسل رقم هاتف المساعد في شات البوت بالأمر: /assphone +201xxxxxxxxx"
+                    ": أرسل رقم هاتف المساعد في شات البوت بالأمر: رقم المساعد +201xxxxxxxxx"
                 );
             }
             break;
@@ -1845,8 +1843,8 @@ void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationStat
                     "⚠️ <b>تنبيه هام:</b> لا تضع الكود في السكرتس ولا تعمل Deploy (لأن عمل Deploy يعيد تشغيل الماشين ويلغي الكود الحالي).\n\n"
                     "✍️ <b>فقط أرسل الكود الآن هنا في جروب السجل أو في خاص البوت</b> مفصولاً بمسافات هكذا:\n"
                     "<code>كود المساعد 1 2 3 4 5</code>\n"
-                    "أو:\n"
-                    "<code>/asscode 1 2 3 4 5</code>";
+                    "أو أرسل الأرقام مباشرة:\n"
+                    "<code>1 2 3 4 5</code>";
                 app.send_message(config::LOGGER_ID, prompt_msg);
                 if (config::OWNER_ID != 0 && config::OWNER_ID != config::LOGGER_ID) {
                     app.send_message(config::OWNER_ID, prompt_msg);
@@ -1855,28 +1853,16 @@ void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationStat
             break;
         }
         case td_api::authorizationStateWaitPassword::ID: {
+            auto* pw_state = static_cast<const td_api::authorizationStateWaitPassword*>(state.get());
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                password_hint_ = pw_state ? pw_state->password_hint_ : "";
+            }
             waiting_code_.store(false);
             waiting_password_.store(true);
-            std::string pass_env = config::getenv_str(("ASSISTANT_PASSWORD" + std::to_string(index_)).c_str(), "");
-            if (!pass_env.empty()) {
-                send_query(td_api::make_object<td_api::checkAuthenticationPassword>(pass_env));
-            } else {
-                LOGGER("AnnieXMedia.core.userbot").warning(
-                    "🔐 المساعد " + std::to_string(index_) + " محمي بكلمة مرور التحقق بخطوتين (2FA)! أرسل في شات البوت: باسورد المساعد كلمه_السر"
-                );
-                std::thread([idx = index_]() {
-                    std::string pwd_msg =
-                        "🔐 <b>الحساب المساعد (" + std::to_string(idx) + ") محمي بكلمة مرور التحقق بخطوتين (2FA)!</b>\n\n"
-                        "أرسل كلمة المرور الآن هنا في جروب السجل أو في خاص البوت هكذا:\n"
-                        "<code>باسورد المساعد كلمه_السر</code>\n"
-                        "أو:\n"
-                        "<code>/asspass كلمه_السر</code>";
-                    app.send_message(config::LOGGER_ID, pwd_msg);
-                    if (config::OWNER_ID != 0 && config::OWNER_ID != config::LOGGER_ID) {
-                        app.send_message(config::OWNER_ID, pwd_msg);
-                    }
-                }).detach();
-            }
+            LOGGER("AnnieXMedia.core.userbot").warning(
+                "🔐 المساعد " + std::to_string(index_) + " محمي بكلمة مرور التحقق بخطوتين (2FA)! بانتظار إدخال الباسورد في شات البوت..."
+            );
             break;
         }
         case td_api::authorizationStateReady::ID: {
@@ -2101,8 +2087,7 @@ void AssistantClient::send_message(int64_t chat_id, const std::string& text) {
 Userbot::Userbot() = default;
 
 void Userbot::start() {
-    // استرجاع جلسة المساعد المحفوظة في MongoDB إن وجدت قبل بدء TDLib
-    std::system("python3 /usr/local/bin/td_session_sync.py restore >/dev/null 2>&1");
+    if (std::system("python3 /usr/local/bin/td_session_sync.py restore >/dev/null 2>&1") != 0) {}
 
     LOGGER("AnnieXMedia.core.userbot").info("💝 جارٍ بدء تشغيل حسابات المساعدين (TDLib Native)...");
     if (!config::STRING1.empty()) {
@@ -2151,7 +2136,7 @@ std::shared_ptr<AssistantClient> Userbot::get_by_index(int index) const {
 EOF
 
 # ------------------------------------------------------------------
-# 6. تحديث AnnieXMedia/main.cpp لدعم إدخال الكود مباشرة من شات البوت أو جروب السجل بدون Deploy
+# 6. تحديث AnnieXMedia/main.cpp لدعم إدخال الكود والباسورد تفاعلياً في شات البوت مع فحص الأخطاء
 # ------------------------------------------------------------------
 cat << 'EOF' > AnnieXMedia/main.cpp
 // ── 𝚂ᴏᴜʀᴄᴇ ✘ 𝐁ᴏᴅᴀ © 2026 (C++20 Edition - TDLib & Native NTgCalls) ──────────
@@ -2169,6 +2154,7 @@ cat << 'EOF' > AnnieXMedia/main.cpp
 #include "AnnieXMedia/utils/cookie_handler.hpp"
 #include "AnnieXMedia/utils/database.hpp"
 
+#include <algorithm>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -2208,7 +2194,19 @@ static void start_healthcheck_server() {
     }).detach();
 }
 
-// تسجيل أوامر تفاعلية لتسجيل دخول الحساب المساعد في TDLib مباشرة من شات البوت أو جروب السجل بدون الحاجة لتعديل السكرتس
+static std::string normalize_arabic_digits(std::string s) {
+    for (int i = 0; i < 10; ++i) {
+        std::string ar = "\xD9" + std::string(1, static_cast<char>(0xA0 + i));
+        std::string fa = "\xDB" + std::string(1, static_cast<char>(0xB0 + i));
+        std::string en(1, static_cast<char>('0' + i));
+        size_t pos = 0;
+        while ((pos = s.find(ar, pos)) != std::string::npos) s.replace(pos, ar.size(), en);
+        pos = 0;
+        while ((pos = s.find(fa, pos)) != std::string::npos) s.replace(pos, fa.size(), en);
+    }
+    return s;
+}
+
 static void register_assistant_login_commands() {
     core::app.on_message([](const core::IncomingMessage& msg) -> bool {
         bool is_authorized_user = (msg.sender_user_id == config::OWNER_ID ||
@@ -2216,7 +2214,9 @@ static void register_assistant_login_commands() {
                                    msg.chat_id == config::LOGGER_ID);
         if (!is_authorized_user) return false;
 
-        std::string t = msg.text;
+        std::string t = normalize_arabic_digits(msg.text);
+        while (!t.empty() && (t.front() == ' ' || t.front() == '\t' || t.front() == '\r' || t.front() == '\n')) t.erase(t.begin());
+        while (!t.empty() && (t.back() == ' ' || t.back() == '\t' || t.back() == '\r' || t.back() == '\n')) t.pop_back();
         if (t.empty()) return false;
 
         auto extract_arg = [](const std::string& s, const std::string& prefix) -> std::string {
@@ -2227,6 +2227,7 @@ static void register_assistant_login_commands() {
             return rest;
         };
 
+        // 1. أمر إدخال أو تغيير رقم الهاتف
         std::string phone = extract_arg(t, "/assphone");
         if (phone.empty()) phone = extract_arg(t, "رقم المساعد");
         if (!phone.empty()) {
@@ -2240,30 +2241,33 @@ static void register_assistant_login_commands() {
             );
             if (r && r->get_id() == core::td_api::error::ID) {
                 auto* err = static_cast<const core::td_api::error*>(r.get());
-                core::app.send_message(msg.chat_id, "❌ خطأ من تيليجرام أثناء إرسال الرقم:\n<code>" + err->message_ + "</code>", {}, msg.id);
+                core::app.send_message(
+                    msg.chat_id,
+                    "❌ <b>الرقم غير صحيح أو مرفوض من تيليجرام:</b>\n<code>" + err->message_ + "</code>\n\n"
+                    "تأكد من كتابة الرقم بالصيغة الدولية مع مفتاح الدولة (مثال: <code>رقم المساعد +2010xxxxxxxx</code>).",
+                    {}, msg.id
+                );
             } else {
                 core::app.send_message(
                     msg.chat_id,
                     "📲 <b>تم إرسال كود التفعيل إلى رقم المساعد (" + phone + ") على تيليجرام!</b>\n\n"
-                    "أرسل الكود الآن هنا في الشات مفصولاً بمسافات (بدون تعديل السكرتس وبدون عمل Deploy) هكذا:\n"
-                    "<code>كود المساعد 1 2 3 4 5</code>",
+                    "✍️ أرسل الكود الآن هنا في الشات مفصولاً بمسافات (مثال: <code>1 2 3 4 5</code> أو <code>كود المساعد 1 2 3 4 5</code>):",
                     {}, msg.id
                 );
             }
             return true;
         }
 
+        // 2. أمر إدخال كود التفعيل (أو إرسال الأرقام مباشرة عندما يكون المساعد بانتظار الكود)
         std::string code = extract_arg(t, "/asscode");
         if (code.empty()) code = extract_arg(t, "كود المساعد");
-        // إذا كان المساعد بانتظار الكود وأرسل المالك الكود مباشرة كأرقام (مثال: 1 2 3 4 5)
         if (code.empty() && core::userbot.one && core::userbot.one->is_waiting_code()) {
-            std::string trimmed = t;
-            bool only_digits_and_spaces = !trimmed.empty() && std::all_of(trimmed.begin(), trimmed.end(), [](unsigned char c) {
+            bool looks_like_code = std::all_of(t.begin(), t.end(), [](unsigned char c) {
                 return std::isdigit(c) || c == ' ' || c == '-';
             });
-            if (only_digits_and_spaces) {
+            if (looks_like_code) {
                 std::string d;
-                for (char c : trimmed) if (std::isdigit(static_cast<unsigned char>(c))) d.push_back(c);
+                for (char c : t) if (std::isdigit(static_cast<unsigned char>(c))) d.push_back(c);
                 if (d.size() >= 4 && d.size() <= 6) {
                     code = d;
                 }
@@ -2275,45 +2279,95 @@ static void register_assistant_login_commands() {
             for (char c : code) {
                 if (std::isdigit(static_cast<unsigned char>(c))) digits_only.push_back(c);
             }
-            if (!core::userbot.one || digits_only.empty()) {
-                core::app.send_message(msg.chat_id, "⚠️ أرسل رقم الهاتف أولاً بالأمر:\n<code>/assphone +201xxxxxxxxx</code>", {}, msg.id);
+            if (!core::userbot.one) {
+                core::app.send_message(msg.chat_id, "⚠️ أرسل رقم الهاتف أولاً بالأمر:\n<code>رقم المساعد +201xxxxxxxxx</code>", {}, msg.id);
                 return true;
             }
+            if (digits_only.size() < 4 || digits_only.size() > 6) {
+                core::app.send_message(
+                    msg.chat_id,
+                    "❌ <b>صيغة الكود غير صحيحة!</b>\n"
+                    "كود تيليجرام يتكون من 5 أرقام. أرسله مفصولاً بمسافات هكذا:\n"
+                    "<code>كود المساعد 1 2 3 4 5</code>",
+                    {}, msg.id
+                );
+                return true;
+            }
+
             auto r = core::userbot.one->send_query_sync(
                 core::td_api::make_object<core::td_api::checkAuthenticationCode>(digits_only), 10
             );
             if (r && r->get_id() == core::td_api::error::ID) {
                 auto* err = static_cast<const core::td_api::error*>(r.get());
-                core::app.send_message(msg.chat_id, "❌ الكود غير صحيح أو انتهت صلاحيته:\n<code>" + err->message_ + "</code>", {}, msg.id);
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(800));
-                if (core::userbot.one->is_authorized()) {
-                    core::userbot.one->finalize_authorization();
+                std::string err_msg = err->message_;
+                if (err_msg.find("PHONE_CODE_INVALID") != std::string::npos) {
                     core::app.send_message(
                         msg.chat_id,
-                        "✅ <b>تم تسجيل دخول وتشغيل الحساب المساعد بنجاح!</b>\n"
-                        "• الاسم: " + core::userbot.one->name + "\n"
-                        "• الآيدي: <code>" + std::to_string(core::userbot.one->id) + "</code>\n"
-                        "• اليوزر: @" + core::userbot.one->username,
+                        "❌ <b>الكود الذي أدخلته غلط (غير صحيح)!</b>\n\n"
+                        "تأكد من الأرقام التي وصلتك في رسالة تيليجرام وأرسل الكود الصحيح مرة أخرى هكذا:\n"
+                        "<code>كود المساعد 1 2 3 4 5</code>",
+                        {}, msg.id
+                    );
+                } else if (err_msg.find("PHONE_CODE_EXPIRED") != std::string::npos) {
+                    core::userbot.one->send_query(core::td_api::make_object<core::td_api::resendAuthenticationCode>(nullptr));
+                    core::app.send_message(
+                        msg.chat_id,
+                        "⚠️ <b>انتهت صلاحية هذا الكود!</b>\n\n"
+                        "تم طلب إرسال كود جديد تلقائياً، أو يمكنك طلب كود جديد بإرسال:\n"
+                        "<code>رقم المساعد +201xxxxxxxxx</code>",
                         {}, msg.id
                     );
                 } else {
                     core::app.send_message(
                         msg.chat_id,
-                        "🔐 <b>تم قبول الكود!</b>\n"
-                        "إذا كان الحساب محمياً بكلمة مرور التحقق بخطوتين (2FA)، أرسلها الآن هكذا:\n"
-                        "<code>باسورد المساعد كلمه_السر</code>\n"
-                        "أو:\n"
-                        "<code>/asspass كلمه_السر</code>",
+                        "❌ <b>خطأ أثناء التحقق من الكود:</b>\n<code>" + err_msg + "</code>\n"
+                        "حاول إرسال الكود الصحيح مرة أخرى.",
                         {}, msg.id
                     );
                 }
+                return true;
+            }
+
+            // الكود صحيح! ننتظر لحظة لنرى هل الحساب عليه باسورد تحقق بخطوتين (2FA) أم دخل مباشرة
+            for (int i = 0; i < 25; ++i) {
+                if (core::userbot.one->is_authorized() || core::userbot.one->is_waiting_password()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+
+            if (core::userbot.one->is_waiting_password()) {
+                std::string hint = core::userbot.one->get_password_hint();
+                std::string hint_line = hint.empty() ? "" : ("\n• <b>تلميح الباسورد :</b> <code>" + hint + "</code>\n");
+                core::app.send_message(
+                    msg.chat_id,
+                    "✅ <b>الكود صحيح!</b>\n"
+                    "🔐 <b>هذا الحساب محمي بكلمة مرور التحقق بخطوتين (2FA).</b>" + hint_line + "\n"
+                    "✍️ <b>أرسل الباسورد الآن هنا في الشات مباشرة</b> أو بهذا الأمر:\n"
+                    "<code>باسورد المساعد كلمه_السر</code>",
+                    {}, msg.id
+                );
+            } else {
+                core::userbot.one->finalize_authorization();
+                core::app.send_message(
+                    msg.chat_id,
+                    "✅ <b>الكود صحيح! الحساب ليس عليه باسورد، وتم تسجيل الدخول وتشغيل الحساب المساعد بنجاح 🤍</b>\n\n"
+                    "• <b>الاسم :</b> " + core::userbot.one->name + "\n"
+                    "• <b>الآيدي :</b> <code>" + std::to_string(core::userbot.one->id) + "</code>\n"
+                    "• <b>اليوزر :</b> @" + core::userbot.one->username,
+                    {}, msg.id
+                );
             }
             return true;
         }
 
-        std::string pass = extract_arg(t, "/asspass");
-        if (pass.empty()) pass = extract_arg(t, "باسورد المساعد");
+        // 3. أمر إدخال باسورد التحقق بخطوتين (أو إرسال الباسورد مباشرة في خاص البوت عندما يكون المساعد بانتظار الباسورد)
+        std::string pass = extract_arg(msg.text, "/asspass");
+        if (pass.empty()) pass = extract_arg(msg.text, "باسورد المساعد");
+        if (pass.empty() && core::userbot.one && core::userbot.one->is_waiting_password() && msg.is_private && t[0] != '/') {
+            pass = msg.text;
+            while (!pass.empty() && (pass.front() == ' ' || pass.front() == '\t')) pass.erase(pass.begin());
+            while (!pass.empty() && (pass.back() == ' ' || pass.back() == '\t' || pass.back() == '\r' || pass.back() == '\n')) pass.pop_back();
+        }
+
         if (!pass.empty()) {
             if (!core::userbot.one) {
                 core::app.send_message(msg.chat_id, "⚠️ أرسل رقم الهاتف والكود أولاً.", {}, msg.id);
@@ -2324,19 +2378,31 @@ static void register_assistant_login_commands() {
             );
             if (r && r->get_id() == core::td_api::error::ID) {
                 auto* err = static_cast<const core::td_api::error*>(r.get());
-                core::app.send_message(msg.chat_id, "❌ كلمة المرور غير صحيحة:\n<code>" + err->message_ + "</code>", {}, msg.id);
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(800));
-                core::userbot.one->finalize_authorization();
+                std::string hint = core::userbot.one->get_password_hint();
+                std::string hint_line = hint.empty() ? "" : ("\n• <b>تلميح الباسورد :</b> <code>" + hint + "</code>");
                 core::app.send_message(
                     msg.chat_id,
-                    "✅ <b>تم تسجيل دخول وتشغيل الحساب المساعد بنجاح!</b>\n"
-                    "• الاسم: " + core::userbot.one->name + "\n"
-                    "• الآيدي: <code>" + std::to_string(core::userbot.one->id) + "</code>\n"
-                    "• اليوزر: @" + core::userbot.one->username,
+                    "❌ <b>الباسورد الذي أدخلته غلط (غير صحيح)!</b>\n"
+                    "<code>" + err->message_ + "</code>" + hint_line + "\n\n"
+                    "تأكد من كلمة مرور التحقق بخطوتين وأرسلها مرة أخرى هكذا:\n"
+                    "<code>باسورد المساعد كلمه_السر</code>",
                     {}, msg.id
                 );
+                return true;
             }
+
+            for (int i = 0; i < 25 && !core::userbot.one->is_authorized(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            core::userbot.one->finalize_authorization();
+            core::app.send_message(
+                msg.chat_id,
+                "✅ <b>الباسورد صحيح! تم تسجيل الدخول وتشغيل الحساب المساعد بنجاح 🤍</b>\n\n"
+                "• <b>الاسم :</b> " + core::userbot.one->name + "\n"
+                "• <b>الآيدي :</b> <code>" + std::to_string(core::userbot.one->id) + "</code>\n"
+                "• <b>اليوزر :</b> @" + core::userbot.one->username,
+                {}, msg.id
+            );
             return true;
         }
 
