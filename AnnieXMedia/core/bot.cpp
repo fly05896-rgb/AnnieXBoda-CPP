@@ -1,12 +1,54 @@
 #include "AnnieXMedia/core/bot.hpp"
 #include "AnnieXMedia/logging.hpp"
 #include "config.hpp"
+
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
+#include <regex>
+#include <unordered_map>
 
 namespace AnnieXMedia::core {
 
 MusicBotClient app;
+
+static std::mutex g_cache_mtx;
+static std::unordered_map<int64_t, std::pair<std::string, std::string>> g_user_cache;
+static std::unordered_map<int64_t, std::pair<std::string, std::string>> g_chat_cache;
+static std::unordered_map<int64_t, int64_t> g_msg_id_map;
+
+static int64_t resolve_message_id(int64_t msg_id) {
+    std::lock_guard<std::mutex> lk(g_cache_mtx);
+    auto it = g_msg_id_map.find(msg_id);
+    if (it != g_msg_id_map.end()) return it->second;
+    return msg_id;
+}
+
+static std::string fix_html_links(const std::string& html) {
+    static const std::regex unquoted_href(R"(<a\s+href=([^"'\s>]+)>)");
+    return std::regex_replace(html, unquoted_href, "<a href=\"$1\">");
+}
+
+static std::string ensure_local_image(const std::string& path_or_url) {
+    if (path_or_url.empty()) return "";
+    if (std::filesystem::exists(path_or_url) && std::filesystem::file_size(path_or_url) > 256) {
+        return path_or_url;
+    }
+    if (path_or_url.rfind("http://", 0) == 0 || path_or_url.rfind("https://", 0) == 0) {
+        std::filesystem::create_directories(config::DOWNLOAD_PATH + "/thumbs");
+        std::string hash_name = std::to_string(std::hash<std::string>{}(path_or_url));
+        std::string local_file = config::DOWNLOAD_PATH + "/thumbs/img_" + hash_name + ".jpg";
+        if (std::filesystem::exists(local_file) && std::filesystem::file_size(local_file) > 512) {
+            return local_file;
+        }
+        std::string cmd = "curl -sL --max-time 8 -A \"Mozilla/5.0\" \"" + path_or_url + "\" -o \"" + local_file + "\"";
+        (void)std::system(cmd.c_str());
+        if (std::filesystem::exists(local_file) && std::filesystem::file_size(local_file) > 512) {
+            return local_file;
+        }
+    }
+    return "";
+}
 
 MusicBotClient::MusicBotClient() {
     td::ClientManager::execute(td_api::make_object<td_api::setLogVerbosityLevel>(1));
@@ -50,17 +92,32 @@ void MusicBotClient::on_authorization_state_update(td_api::object_ptr<td_api::Au
             req->database_directory_ = "td_db/bot";
             req->use_message_database_ = true;
             req->use_secret_chats_ = false;
-            req->api_id_ = config::API_ID;
-            req->api_hash_ = config::API_HASH;
+            req->api_id_ = config::API_ID > 0 ? config::API_ID : 94575;
+            req->api_hash_ = config::API_HASH.size() >= 20 ? config::API_HASH : "a3406de8d171bb422bb6ddf3bbd800e2";
             req->system_language_code_ = "ar";
             req->device_model_ = "AnnieXBoda C++ Server";
             req->system_version_ = "Linux x86_64";
             req->application_version_ = "3.0.0";
-            send_query(std::move(req));
+            send_query(std::move(req), [](td_api::object_ptr<td_api::Object> obj) {
+                if (obj && obj->get_id() == td_api::error::ID) {
+                    auto* err = static_cast<const td_api::error*>(obj.get());
+                    LOGGER("AnnieXMedia.core.bot").error("❌ خطأ في setTdlibParameters: [" + std::to_string(err->code_) + "] " + err->message_);
+                }
+            });
             break;
         }
         case td_api::authorizationStateWaitPhoneNumber::ID: {
-            send_query(td_api::make_object<td_api::checkAuthenticationBotToken>(config::BOT_TOKEN));
+            if (config::BOT_TOKEN.empty() || config::BOT_TOKEN.find(':') == std::string::npos) {
+                LOGGER("AnnieXMedia.core.bot").error("⚠️ قيمة BOT_TOKEN في السكرتس غير صحيحة!");
+            } else {
+                send_query(td_api::make_object<td_api::checkAuthenticationBotToken>(config::BOT_TOKEN),
+                           [](td_api::object_ptr<td_api::Object> obj) {
+                               if (obj && obj->get_id() == td_api::error::ID) {
+                                   auto* err = static_cast<const td_api::error*>(obj.get());
+                                   LOGGER("AnnieXMedia.core.bot").error("❌ خطأ في checkAuthenticationBotToken: [" + std::to_string(err->code_) + "] " + err->message_);
+                               }
+                           });
+            }
             break;
         }
         case td_api::authorizationStateReady::ID: {
@@ -75,9 +132,42 @@ void MusicBotClient::on_authorization_state_update(td_api::object_ptr<td_api::Au
 
 void MusicBotClient::process_update(td_api::object_ptr<td_api::Object> update) {
     if (!update) return;
+
     if (update->get_id() == td_api::updateAuthorizationState::ID) {
         auto u = td_api::move_object_as<td_api::updateAuthorizationState>(update);
         on_authorization_state_update(std::move(u->authorization_state_));
+        return;
+    }
+
+    if (update->get_id() == td_api::updateUser::ID) {
+        auto u = td_api::move_object_as<td_api::updateUser>(update);
+        if (u->user_) {
+            std::string full_name = u->user_->first_name_ + (u->user_->last_name_.empty() ? "" : (" " + u->user_->last_name_));
+            std::string uname;
+            if (u->user_->usernames_ && !u->user_->usernames_->active_usernames_.empty()) {
+                uname = u->user_->usernames_->active_usernames_[0];
+            }
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            g_user_cache[u->user_->id_] = {full_name, uname};
+        }
+        return;
+    }
+
+    if (update->get_id() == td_api::updateNewChat::ID) {
+        auto u = td_api::move_object_as<td_api::updateNewChat>(update);
+        if (u->chat_) {
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            g_chat_cache[u->chat_->id_].first = u->chat_->title_;
+        }
+        return;
+    }
+
+    if (update->get_id() == td_api::updateMessageSendSucceeded::ID) {
+        auto u = td_api::move_object_as<td_api::updateMessageSendSucceeded>(update);
+        if (u->message_) {
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            g_msg_id_map[u->old_message_id_] = u->message_->id_;
+        }
         return;
     }
 
@@ -95,7 +185,24 @@ void MusicBotClient::process_update(td_api::object_ptr<td_api::Object> update) {
         if (u->message_->sender_id_ && u->message_->sender_id_->get_id() == td_api::messageSenderUser::ID) {
             auto* sender = static_cast<const td_api::messageSenderUser*>(u->message_->sender_id_.get());
             msg.sender_user_id = sender->user_id_;
+            {
+                std::lock_guard<std::mutex> lk(g_cache_mtx);
+                auto it = g_user_cache.find(msg.sender_user_id);
+                if (it != g_user_cache.end()) {
+                    msg.sender_first_name = it->second.first;
+                    msg.sender_username = it->second.second;
+                }
+            }
         }
+        {
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            auto it = g_chat_cache.find(msg.chat_id);
+            if (it != g_chat_cache.end()) {
+                msg.chat_title = it->second.first;
+                msg.chat_username = it->second.second;
+            }
+        }
+
         if (u->message_->reply_to_ && u->message_->reply_to_->get_id() == td_api::messageReplyToMessage::ID) {
             auto* rep = static_cast<const td_api::messageReplyToMessage*>(u->message_->reply_to_.get());
             msg.reply_to_message_id = rep->message_id_;
@@ -173,7 +280,23 @@ void MusicBotClient::process_update(td_api::object_ptr<td_api::Object> update) {
             std::lock_guard<std::mutex> lock(handlers_mutex_);
             handlers = message_handlers_;
         }
-        std::thread([handlers, msg]() {
+        std::thread([this, handlers, msg]() mutable {
+            if (msg.sender_first_name.empty() && msg.sender_user_id != 0) {
+                auto u_obj = this->send_query_sync(td_api::make_object<td_api::getUser>(msg.sender_user_id), 2);
+                if (u_obj && u_obj->get_id() == td_api::user::ID) {
+                    auto* usr = static_cast<const td_api::user*>(u_obj.get());
+                    msg.sender_first_name = usr->first_name_ + (usr->last_name_.empty() ? "" : (" " + usr->last_name_));
+                    if (usr->usernames_ && !usr->usernames_->active_usernames_.empty()) {
+                        msg.sender_username = usr->usernames_->active_usernames_[0];
+                    }
+                }
+            }
+            if (msg.chat_title.empty()) {
+                auto c_obj = this->send_query_sync(td_api::make_object<td_api::getChat>(msg.chat_id), 2);
+                if (c_obj && c_obj->get_id() == td_api::chat::ID) {
+                    msg.chat_title = static_cast<const td_api::chat*>(c_obj.get())->title_;
+                }
+            }
             for (const auto& h : handlers) {
                 try {
                     if (h(msg)) break;
@@ -192,6 +315,14 @@ void MusicBotClient::process_update(td_api::object_ptr<td_api::Object> update) {
         cb.chat_id = u->chat_id_;
         cb.message_id = u->message_id_;
         cb.sender_user_id = u->sender_user_id_;
+        {
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            auto it = g_user_cache.find(cb.sender_user_id);
+            if (it != g_user_cache.end()) {
+                cb.sender_first_name = it->second.first;
+                cb.sender_username = it->second.second;
+            }
+        }
         if (u->payload_ && u->payload_->get_id() == td_api::callbackQueryPayloadData::ID) {
             auto* p = static_cast<const td_api::callbackQueryPayloadData*>(u->payload_.get());
             cb.data = p->data_;
@@ -244,7 +375,6 @@ void MusicBotClient::start() {
         }
     });
 
-    // Wait up to 20s for authorization
     for (int i = 0; i < 200 && !authorized_.load(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -260,12 +390,13 @@ void MusicBotClient::start() {
             this->username = config::BOT_USERNAME;
         }
         this->mention = "<a href=\"tg://user?id=" + std::to_string(this->id) + "\">" + this->name + "</a>";
+        config::BOT_USERNAME = this->username;
+        config::BOT_NAME = this->name;
     } else {
         this->name = config::BOT_NAME;
         this->username = config::BOT_USERNAME;
     }
 
-    // Send startup notification to LOGGER_ID
     send_message(
         config::LOGGER_ID,
         "<u><b>» " + this->mention + " ʙᴏᴛ sᴛᴀʀᴛᴇᴅ (C++ TDLib & Native NTgCalls) :</b></u>\n\n"
@@ -300,14 +431,19 @@ void MusicBotClient::on_callback_query(CallbackHandlerFn fn) {
 }
 
 td_api::object_ptr<td_api::formattedText> MusicBotClient::parse_html_text(const std::string& html) const {
+    std::string fixed_html = fix_html_links(html);
     auto res = td::ClientManager::execute(
-        td_api::make_object<td_api::parseTextEntities>(html, td_api::make_object<td_api::textParseModeHTML>())
+        td_api::make_object<td_api::parseTextEntities>(fixed_html, td_api::make_object<td_api::textParseModeHTML>())
     );
     if (res && res->get_id() == td_api::formattedText::ID) {
         return td_api::move_object_as<td_api::formattedText>(res);
     }
+    if (res && res->get_id() == td_api::error::ID) {
+        auto* err = static_cast<const td_api::error*>(res.get());
+        LOGGER("AnnieXMedia.core.bot").warning("⚠️ HTML Parse warning: " + err->message_ + " | input: " + fixed_html);
+    }
     auto ft = td_api::make_object<td_api::formattedText>();
-    ft->text_ = html;
+    ft->text_ = fixed_html;
     return ft;
 }
 
@@ -325,7 +461,10 @@ td_api::object_ptr<td_api::ReplyMarkup> MusicBotClient::build_reply_markup(const
             } else {
                 type = td_api::make_object<td_api::inlineKeyboardButtonTypeCallback>(btn.callback_data);
             }
-            td_row.push_back(td_api::make_object<td_api::inlineKeyboardButton>(btn.text, std::move(type)));
+            auto kb_btn = td_api::make_object<td_api::inlineKeyboardButton>();
+            kb_btn->text_ = btn.text;
+            kb_btn->type_ = std::move(type);
+            td_row.push_back(std::move(kb_btn));
         }
         markup->rows_.push_back(std::move(td_row));
     }
@@ -339,20 +478,28 @@ int64_t MusicBotClient::send_message(int64_t chat_id, const std::string& text,
     auto req = td_api::make_object<td_api::sendMessage>();
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
-        req->reply_to_ = td_api::make_object<td_api::inputMessageReplyToMessage>(reply_to_message_id, nullptr, 0);
+        auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
+        req->reply_to_ = std::move(rep);
     }
     req->reply_markup_ = build_reply_markup(reply_markup);
 
     auto content = td_api::make_object<td_api::inputMessageText>();
     content->text_ = parse_html_text(text);
     if (disable_web_page_preview) {
-        content->link_preview_options_ = td_api::make_object<td_api::linkPreviewOptions>(true, "", false, false, false);
+        auto lpo = td_api::make_object<td_api::linkPreviewOptions>();
+        lpo->is_disabled_ = true;
+        content->link_preview_options_ = std::move(lpo);
     }
     req->input_message_content_ = std::move(content);
 
     auto resp = send_query_sync(std::move(req), 8);
     if (resp && resp->get_id() == td_api::message::ID) {
         return static_cast<const td_api::message*>(resp.get())->id_;
+    }
+    if (resp && resp->get_id() == td_api::error::ID && chat_id != config::LOGGER_ID) {
+        auto* err = static_cast<const td_api::error*>(resp.get());
+        LOGGER("AnnieXMedia.core.bot").error("❌ send_message error in chat " + std::to_string(chat_id) + ": [" + std::to_string(err->code_) + "] " + err->message_);
     }
     return 0;
 }
@@ -361,25 +508,36 @@ int64_t MusicBotClient::send_photo(int64_t chat_id, const std::string& photo_pat
                                    const std::string& caption,
                                    const InlineKeyboardMarkup& reply_markup,
                                    int64_t reply_to_message_id) {
+    std::string local_img = ensure_local_image(photo_path_or_url);
     auto req = td_api::make_object<td_api::sendMessage>();
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
-        req->reply_to_ = td_api::make_object<td_api::inputMessageReplyToMessage>(reply_to_message_id, nullptr, 0);
+        auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
+        req->reply_to_ = std::move(rep);
     }
     req->reply_markup_ = build_reply_markup(reply_markup);
 
     auto content = td_api::make_object<td_api::inputMessagePhoto>();
-    if (std::filesystem::exists(photo_path_or_url)) {
-        content->photo_ = td_api::make_object<td_api::inputFileLocal>(photo_path_or_url);
+    auto ip = td_api::make_object<td_api::inputPhoto>();
+    if (!local_img.empty()) {
+        ip->photo_ = td_api::make_object<td_api::inputFileLocal>(local_img);
+    } else if (std::filesystem::exists(photo_path_or_url)) {
+        ip->photo_ = td_api::make_object<td_api::inputFileLocal>(photo_path_or_url);
     } else {
-        content->photo_ = td_api::make_object<td_api::inputFileRemote>(photo_path_or_url);
+        ip->photo_ = td_api::make_object<td_api::inputFileRemote>(photo_path_or_url);
     }
+    content->photo_ = std::move(ip);
     content->caption_ = parse_html_text(caption);
     req->input_message_content_ = std::move(content);
 
-    auto resp = send_query_sync(std::move(req), 10);
+    auto resp = send_query_sync(std::move(req), 12);
     if (resp && resp->get_id() == td_api::message::ID) {
         return static_cast<const td_api::message*>(resp.get())->id_;
+    }
+    if (resp && resp->get_id() == td_api::error::ID) {
+        auto* err = static_cast<const td_api::error*>(resp.get());
+        LOGGER("AnnieXMedia.core.bot").warning("⚠️ send_photo fallback to text (reason: " + err->message_ + ")");
     }
     return send_message(chat_id, caption, reply_markup, reply_to_message_id);
 }
@@ -391,16 +549,20 @@ int64_t MusicBotClient::send_audio(int64_t chat_id, const std::string& audio_pat
     auto req = td_api::make_object<td_api::sendMessage>();
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
-        req->reply_to_ = td_api::make_object<td_api::inputMessageReplyToMessage>(reply_to_message_id, nullptr, 0);
+        auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
+        req->reply_to_ = std::move(rep);
     }
     req->reply_markup_ = build_reply_markup(reply_markup);
 
     auto content = td_api::make_object<td_api::inputMessageAudio>();
-    content->audio_ = std::filesystem::exists(audio_path)
+    auto ia = td_api::make_object<td_api::inputAudio>();
+    ia->audio_ = std::filesystem::exists(audio_path)
         ? td_api::object_ptr<td_api::InputFile>(td_api::make_object<td_api::inputFileLocal>(audio_path))
         : td_api::object_ptr<td_api::InputFile>(td_api::make_object<td_api::inputFileRemote>(audio_path));
-    content->duration_ = duration;
-    content->title_ = title;
+    ia->duration_ = duration;
+    ia->title_ = title;
+    content->audio_ = std::move(ia);
     content->caption_ = parse_html_text(caption);
     req->input_message_content_ = std::move(content);
 
@@ -418,16 +580,20 @@ int64_t MusicBotClient::send_video(int64_t chat_id, const std::string& video_pat
     auto req = td_api::make_object<td_api::sendMessage>();
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
-        req->reply_to_ = td_api::make_object<td_api::inputMessageReplyToMessage>(reply_to_message_id, nullptr, 0);
+        auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
+        req->reply_to_ = std::move(rep);
     }
     req->reply_markup_ = build_reply_markup(reply_markup);
 
     auto content = td_api::make_object<td_api::inputMessageVideo>();
-    content->video_ = std::filesystem::exists(video_path)
+    auto iv = td_api::make_object<td_api::inputVideo>();
+    iv->video_ = std::filesystem::exists(video_path)
         ? td_api::object_ptr<td_api::InputFile>(td_api::make_object<td_api::inputFileLocal>(video_path))
         : td_api::object_ptr<td_api::InputFile>(td_api::make_object<td_api::inputFileRemote>(video_path));
-    content->duration_ = duration;
-    content->supports_streaming_ = true;
+    iv->duration_ = duration;
+    iv->supports_streaming_ = true;
+    content->video_ = std::move(iv);
     content->caption_ = parse_html_text(caption);
     req->input_message_content_ = std::move(content);
 
@@ -443,10 +609,14 @@ int64_t MusicBotClient::send_document(int64_t chat_id, const std::string& doc_pa
     auto req = td_api::make_object<td_api::sendMessage>();
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
-        req->reply_to_ = td_api::make_object<td_api::inputMessageReplyToMessage>(reply_to_message_id, nullptr, 0);
+        auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
+        req->reply_to_ = std::move(rep);
     }
     auto content = td_api::make_object<td_api::inputMessageDocument>();
-    content->document_ = td_api::make_object<td_api::inputFileLocal>(doc_path);
+    auto idoc = td_api::make_object<td_api::inputDocument>();
+    idoc->document_ = td_api::make_object<td_api::inputFileLocal>(doc_path);
+    content->document_ = std::move(idoc);
     content->caption_ = parse_html_text(caption);
     req->input_message_content_ = std::move(content);
     auto resp = send_query_sync(std::move(req), 20);
@@ -460,10 +630,14 @@ int64_t MusicBotClient::send_sticker(int64_t chat_id, const std::string& sticker
     auto req = td_api::make_object<td_api::sendMessage>();
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
-        req->reply_to_ = td_api::make_object<td_api::inputMessageReplyToMessage>(reply_to_message_id, nullptr, 0);
+        auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
+        req->reply_to_ = std::move(rep);
     }
     auto content = td_api::make_object<td_api::inputMessageSticker>();
-    content->sticker_ = td_api::make_object<td_api::inputFileRemote>(sticker_file_id);
+    auto ist = td_api::make_object<td_api::inputSticker>();
+    ist->sticker_ = td_api::make_object<td_api::inputFileRemote>(sticker_file_id);
+    content->sticker_ = std::move(ist);
     req->input_message_content_ = std::move(content);
     auto resp = send_query_sync(std::move(req), 8);
     if (resp && resp->get_id() == td_api::message::ID) {
@@ -476,7 +650,9 @@ int64_t MusicBotClient::send_dice(int64_t chat_id, const std::string& emoji, int
     auto req = td_api::make_object<td_api::sendMessage>();
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
-        req->reply_to_ = td_api::make_object<td_api::inputMessageReplyToMessage>(reply_to_message_id, nullptr, 0);
+        auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
+        req->reply_to_ = std::move(rep);
     }
     auto content = td_api::make_object<td_api::inputMessageDice>(emoji, false);
     req->input_message_content_ = std::move(content);
@@ -489,9 +665,14 @@ int64_t MusicBotClient::send_dice(int64_t chat_id, const std::string& emoji, int
 
 void MusicBotClient::edit_message_text(int64_t chat_id, int64_t message_id, const std::string& text,
                                        const InlineKeyboardMarkup& reply_markup) {
+    int64_t real_id = resolve_message_id(message_id);
+    if (real_id == message_id) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        real_id = resolve_message_id(message_id);
+    }
     auto req = td_api::make_object<td_api::editMessageText>();
     req->chat_id_ = chat_id;
-    req->message_id_ = message_id;
+    req->message_id_ = real_id;
     req->reply_markup_ = build_reply_markup(reply_markup);
     auto content = td_api::make_object<td_api::inputMessageText>();
     content->text_ = parse_html_text(text);
@@ -501,21 +682,28 @@ void MusicBotClient::edit_message_text(int64_t chat_id, int64_t message_id, cons
 
 void MusicBotClient::edit_message_caption(int64_t chat_id, int64_t message_id, const std::string& caption,
                                           const InlineKeyboardMarkup& reply_markup) {
+    int64_t real_id = resolve_message_id(message_id);
     auto req = td_api::make_object<td_api::editMessageCaption>();
     req->chat_id_ = chat_id;
-    req->message_id_ = message_id;
+    req->message_id_ = real_id;
     req->reply_markup_ = build_reply_markup(reply_markup);
     req->caption_ = parse_html_text(caption);
     send_query(std::move(req));
 }
 
 void MusicBotClient::delete_message(int64_t chat_id, int64_t message_id) {
-    delete_messages(chat_id, {message_id});
+    int64_t real_id = resolve_message_id(message_id);
+    if (real_id == message_id) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        real_id = resolve_message_id(message_id);
+    }
+    delete_messages(chat_id, {real_id, message_id});
 }
 
 void MusicBotClient::delete_messages(int64_t chat_id, const std::vector<int64_t>& message_ids) {
     if (message_ids.empty()) return;
-    send_query(td_api::make_object<td_api::deleteMessages>(chat_id, message_ids, true));
+    auto copy_ids = message_ids;
+    send_query(td_api::make_object<td_api::deleteMessages>(chat_id, std::move(copy_ids), true));
 }
 
 void MusicBotClient::answer_callback_query(int64_t callback_query_id, const std::string& text, bool show_alert) {
@@ -544,7 +732,7 @@ std::vector<int64_t> MusicBotClient::get_chat_admins(int64_t chat_id) {
     if (resp && resp->get_id() == td_api::chatAdministrators::ID) {
         auto* ca = static_cast<const td_api::chatAdministrators*>(resp.get());
         for (const auto& a : ca->administrators_) {
-            if (a && !a->is_bot_) admins.push_back(a->user_id_);
+            if (a) admins.push_back(a->user_id_);
         }
     }
     return admins;
@@ -586,39 +774,55 @@ bool MusicBotClient::unban_chat_member(int64_t chat_id, int64_t user_id) {
 }
 
 bool MusicBotClient::mute_chat_member(int64_t chat_id, int64_t user_id, int32_t until_date) {
-    auto perms = td_api::make_object<td_api::chatPermissions>(
-        false, false, false, false, false, false, false, false, false, false, false, false, false, false
-    );
+    auto perms = td_api::make_object<td_api::chatPermissions>();
+    auto status = td_api::make_object<td_api::chatMemberStatusRestricted>(true, until_date, std::move(perms));
     auto req = td_api::make_object<td_api::setChatMemberStatus>(
         chat_id,
         td_api::make_object<td_api::messageSenderUser>(user_id),
-        td_api::make_object<td_api::chatMemberStatusRestricted>(true, until_date, std::move(perms))
+        std::move(status)
     );
     auto r = send_query_sync(std::move(req), 5);
     return r && r->get_id() == td_api::ok::ID;
 }
 
 bool MusicBotClient::unmute_chat_member(int64_t chat_id, int64_t user_id) {
-    auto perms = td_api::make_object<td_api::chatPermissions>(
-        true, true, true, true, true, true, true, true, true, true, false, false, false, false
-    );
+    auto perms = td_api::make_object<td_api::chatPermissions>();
+    perms->can_send_basic_messages_ = true;
+    perms->can_send_audios_ = true;
+    perms->can_send_documents_ = true;
+    perms->can_send_photos_ = true;
+    perms->can_send_videos_ = true;
+    perms->can_send_video_notes_ = true;
+    perms->can_send_voice_notes_ = true;
+    perms->can_send_polls_ = true;
+    perms->can_send_other_messages_ = true;
+    perms->can_add_link_previews_ = true;
+    auto status = td_api::make_object<td_api::chatMemberStatusRestricted>(true, 0, std::move(perms));
     auto req = td_api::make_object<td_api::setChatMemberStatus>(
         chat_id,
         td_api::make_object<td_api::messageSenderUser>(user_id),
-        td_api::make_object<td_api::chatMemberStatusRestricted>(true, 0, std::move(perms))
+        std::move(status)
     );
     auto r = send_query_sync(std::move(req), 5);
     return r && r->get_id() == td_api::ok::ID;
 }
 
 bool MusicBotClient::promote_chat_member(int64_t chat_id, int64_t user_id, bool full_promote) {
-    auto rights = td_api::make_object<td_api::chatAdministratorRights>(
-        true, full_promote, true, true, true, true, true, true, full_promote, true, true, true, true, false
-    );
+    auto rights = td_api::make_object<td_api::chatAdministratorRights>();
+    rights->can_manage_chat_ = true;
+    rights->can_change_info_ = full_promote;
+    rights->can_delete_messages_ = true;
+    rights->can_invite_users_ = true;
+    rights->can_restrict_members_ = true;
+    rights->can_pin_messages_ = true;
+    rights->can_manage_topics_ = true;
+    rights->can_promote_members_ = full_promote;
+    rights->can_manage_video_chats_ = true;
+    auto status = td_api::make_object<td_api::chatMemberStatusAdministrator>(true, std::move(rights));
     auto req = td_api::make_object<td_api::setChatMemberStatus>(
         chat_id,
         td_api::make_object<td_api::messageSenderUser>(user_id),
-        td_api::make_object<td_api::chatMemberStatusAdministrator>("Admin", true, std::move(rights))
+        std::move(status)
     );
     auto r = send_query_sync(std::move(req), 5);
     return r && r->get_id() == td_api::ok::ID;
