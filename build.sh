@@ -2913,3 +2913,4 @@ cmake --build . -j"$JOBS"
 cd "$ROOT_DIR"
 
 echo "🎉 Build finished successfully! Binary: ./build/annie_music_bot"
+exit 0
