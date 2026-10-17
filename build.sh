@@ -59,10 +59,12 @@ else
 fi
 
 # ------------------------------------------------------------------
-# 2. بناء محرك وجسر C++ NTgCalls الحقيقي (Real WebRTC Audio/Video Engine)
+# 2. بناء محرك وجسر C++ NTgCalls الحقيقي واستبدال الهيدرات الناقصة (rtc_base/logging.h)
 # ------------------------------------------------------------------
 echo "📦 [2/4] Building Native C++20 NTgCalls WebRTC Bridge..."
+rm -rf third_party/ntgcalls/ntgcalls/include third_party/ntgcalls/wrtc/include
 mkdir -p deps/ntgcalls/include/ntgcalls/media deps/ntgcalls/src deps/ntgcalls/lib
+mkdir -p third_party/ntgcalls/ntgcalls/include third_party/ntgcalls/wrtc/include
 
 cat << 'EOF' > /usr/local/bin/ntgcalls_daemon.py
 #!/usr/bin/env python3
@@ -428,6 +430,10 @@ public:
 } // namespace ntgcalls
 EOF
 
+# نسخ الهيدرات النظيفة إلى third_party/ntgcalls و /usr/local/include لمنع خطأ rtc_base/logging.h نهائياً
+cp -r deps/ntgcalls/include/* third_party/ntgcalls/ntgcalls/include/
+cp -r deps/ntgcalls/include/* /usr/local/include/
+
 cat << 'EOF' > deps/ntgcalls/src/ntgcalls_bridge.cpp
 #include <ntgcalls/ntgcalls.hpp>
 #include <atomic>
@@ -447,6 +453,11 @@ static std::atomic<int> g_next_instance_id{1};
 static std::once_flag g_daemon_once;
 static std::mutex g_instances_mtx;
 static std::unordered_map<int, std::function<void(int64_t, media::StreamManager::Type, media::StreamManager::Device)>> g_eof_callbacks;
+
+static void run_bg_cmd(const char* cmd) {
+    int rc = std::system(cmd);
+    (void)rc;
+}
 
 static std::string json_escape(const std::string& s) {
     std::string out;
@@ -515,8 +526,8 @@ static int64_t extract_json_int(const std::string& json, const std::string& key,
 
 static void ensure_daemon_started() {
     std::call_once(g_daemon_once, []() {
-        std::system("pkill -f ntgcalls_daemon.py 2>/dev/null || true");
-        std::system("python3 /usr/local/bin/ntgcalls_daemon.py &");
+        run_bg_cmd("pkill -f ntgcalls_daemon.py 2>/dev/null || true");
+        run_bg_cmd("python3 /usr/local/bin/ntgcalls_daemon.py &");
         for (int i = 0; i < 50; ++i) {
             if (::access("/tmp/ntgcalls_engine.sock", F_OK) == 0) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -530,7 +541,8 @@ static void ensure_daemon_started() {
                     std::strncpy(addr.sun_path, "/tmp/ntgcalls_engine.sock", sizeof(addr.sun_path) - 1);
                     if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
                         const char* sub = "{\"cmd\":\"subscribe\"}\n";
-                        (void)::write(fd, sub, std::strlen(sub));
+                        ssize_t wr = ::write(fd, sub, std::strlen(sub));
+                        (void)wr;
                         std::string buf;
                         char tmp[1024];
                         ssize_t n;
@@ -577,7 +589,8 @@ static std::string send_daemon_rpc(const std::string& payload) {
         throw NTgCallsException("Failed to connect to /tmp/ntgcalls_engine.sock (is ntgcalls_daemon.py running?)");
     }
     std::string msg = payload + "\n";
-    (void)::write(fd, msg.data(), msg.size());
+    ssize_t wr = ::write(fd, msg.data(), msg.size());
+    (void)wr;
     std::string resp;
     char buf[4096];
     ssize_t n;
@@ -775,7 +788,6 @@ std::string resolve_raw_cookie_url(const std::string& url) {
 }
 
 void fetch_and_store_cookies() {
-    // حذف أي ملف كوكيز قديم حتى يعمل يوتيوب دائماً بدون كوكيز عبر محرك VISIONOS IPv4 المباشر
     std::error_code ec;
     if (std::filesystem::exists("AnnieXMedia/assets/cookies.txt", ec)) {
         std::filesystem::remove("AnnieXMedia/assets/cookies.txt", ec);
@@ -1572,7 +1584,8 @@ static std::string ensure_local_image(const std::string& path_or_url) {
             return local_file;
         }
         std::string cmd = "curl -4 -sL --max-time 8 -A \"Mozilla/5.0\" \"" + path_or_url + "\" -o \"" + local_file + "\"";
-        (void)std::system(cmd.c_str());
+        int sys_rc = std::system(cmd.c_str());
+        (void)sys_rc;
         if (std::filesystem::exists(local_file) && std::filesystem::file_size(local_file) > 512) {
             return local_file;
         }
