@@ -26,33 +26,34 @@ ntgcalls::media::MediaDescription build_native_media_description(
     bool video,
     const std::string& ffmpeg_opts
 ) {
-    // Direct C++ NTgCalls v3.0 MediaDescription using FFmpeg shell pipe:
-    // - AudioQuality.HIGH equivalent: 48000 Hz, 2 channels, s16le PCM
-    // - VideoQuality.HD_720p equivalent: 1280x720, 30 fps, yuv420p rawvideo
-    std::string base_flags = "-probesize 512k -analyzeduration 1000000 ";
+    bool is_url = (path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0);
+    std::string reconnect_flags = is_url
+        ? "-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2 "
+        : "";
+    std::string base_flags = "-nostdin -hide_banner -loglevel warning " + reconnect_flags + "-probesize 512k -analyzeduration 1000000 ";
     std::string extra = ffmpeg_opts.empty() ? "" : (ffmpeg_opts + " ");
 
-    std::string audio_cmd = "ffmpeg -loglevel panic " + base_flags + extra +
-                            "-i \"" + path + "\" -f s16le -ac 2 -ar 48000 pipe:1";
+    std::string audio_cmd = "ffmpeg " + base_flags + extra +
+                            "-i \"" + path + "\" -f s16le -ac 2 -ar 48000 -vn pipe:1";
 
     ntgcalls::media::AudioDescription audio_desc(
         ntgcalls::media::BaseMediaDescription::MediaSource::Shell,
         48000,
         2,
         audio_cmd,
-        false
+        true
     );
 
     if (video) {
-        std::string video_cmd = "ffmpeg -loglevel panic " + base_flags + extra +
-                                "-i \"" + path + "\" -f rawvideo -r 30 -pix_fmt yuv420p -vf scale=1280:720 pipe:1";
+        std::string video_cmd = "ffmpeg " + base_flags + extra +
+                                "-i \"" + path + "\" -f rawvideo -r 30 -pix_fmt yuv420p -vf scale=1280:720 -an pipe:1";
         ntgcalls::media::VideoDescription video_desc(
             ntgcalls::media::BaseMediaDescription::MediaSource::Shell,
             1280,
             720,
             30,
             video_cmd,
-            false
+            true
         );
         return ntgcalls::media::MediaDescription(audio_desc, std::nullopt, video_desc, std::nullopt);
     }
@@ -207,7 +208,7 @@ void Call::speedup_stream(int64_t chat_id, const std::string& file_path, double 
 
     bool is_video = (playing[0].streamtype == "video");
     std::string target_input = file_path;
-    if (file_path.rfind("vid_", 0) == 0 || !std::filesystem::exists(file_path)) {
+    if (file_path.rfind("vid_", 0) == 0 || (!std::filesystem::exists(file_path) && file_path.rfind("http", 0) != 0)) {
         std::string direct = platforms::YouTube.get_direct_link(
             !playing[0].vidid.empty() ? ("https://www.youtube.com/watch?v=" + playing[0].vidid) : file_path,
             !is_video
@@ -215,38 +216,12 @@ void Call::speedup_stream(int64_t chat_id, const std::string& file_path, double 
         if (!direct.empty()) target_input = direct;
     }
 
-    std::filesystem::create_directories("downloads");
-    std::string ext = is_video ? "mp4" : "m4a";
-    std::string out_file = "downloads/speed_" + std::to_string(chat_id) + "_" + std::to_string(speed) + "." + ext;
-
-    if (!std::filesystem::exists(out_file)) {
-        double setpts = 1.0 / (speed > 0.1 ? speed : 1.0);
-        std::string cmd;
-        if (is_video) {
-            cmd = "ffmpeg -y -i \"" + target_input + "\" -filter:v \"setpts=" + std::to_string(setpts) +
-                  "*PTS\" -filter:a \"atempo=" + std::to_string(speed) + "\" -preset ultrafast \"" + out_file + "\"";
-        } else {
-            cmd = "ffmpeg -y -i \"" + target_input + "\" -vn -filter:a \"atempo=" + std::to_string(speed) + "\" \"" + out_file + "\"";
-        }
-        run_shell_command(cmd);
-    }
-
     int played_secs = playing[0].played;
-    int new_played = speed > 0 ? static_cast<int>(played_secs / speed) : 0;
-    int old_seconds = playing[0].old_second > 0 ? playing[0].old_second : playing[0].seconds;
-    if (playing[0].old_dur.empty()) {
-        playing[0].old_dur = playing[0].dur;
-        playing[0].old_second = old_seconds;
+    std::string extra_opts = "-filter:a \"atempo=" + std::to_string(speed) + "\"";
+    if (played_secs > 0) {
+        extra_opts = "-ss " + std::to_string(played_secs) + " " + extra_opts;
     }
-    int new_total = speed > 0 ? static_cast<int>(old_seconds / speed) : old_seconds;
-    playing[0].seconds = new_total;
-    playing[0].dur = utils::formatters::seconds_to_min(new_total);
-    playing[0].played = new_played;
-    playing[0].speed_path = out_file;
-    playing[0].speed = speed;
-
-    std::string ffmpeg_opts = new_played > 0 ? ("-ss " + utils::formatters::seconds_to_min(new_played)) : "";
-    auto media = build_native_media_description(out_file, is_video, ffmpeg_opts);
+    auto media = build_native_media_description(target_input, is_video, extra_opts);
     ntg->set_stream_sources(chat_id, ntgcalls::media::StreamManager::Mode::Capture, media);
 }
 
@@ -276,39 +251,38 @@ void Call::join_call(int64_t chat_id, int64_t original_chat_id, const std::strin
     if (!ntg || !ass) {
         std::lock_guard<std::mutex> g(global_mtx_);
         joining_chats_.erase(chat_id);
-        throw std::runtime_error("No active assistant or NTgCalls instance available.");
+        throw std::runtime_error("لم يتم تهيئة الحساب المساعد أو محرك NTgCalls بعد.");
     }
 
+    LOGGER("AnnieXMedia.core.call").info("🔊 Preparing NTgCalls stream for chat " + std::to_string(chat_id) + " with source: " + link.substr(0, 80));
     auto media = build_native_media_description(link, video);
     active_calls.insert(chat_id);
     utils::database::add_active_chat(chat_id);
 
     auto calls_map = ntg->calls();
     if (calls_map.count(chat_id)) {
-        // Already in call -> just switch stream sources directly in C++ NTgCalls
+        LOGGER("AnnieXMedia.core.call").info("🔄 Switching active NTgCalls stream in chat " + std::to_string(chat_id));
         ntg->set_stream_sources(chat_id, ntgcalls::media::StreamManager::Mode::Capture, media);
     } else {
-        // Fresh call connection:
-        // 1. ntg->create_call(chat_id) -> returns local WebRTC fingerprint & SSRC JSON
-        // 2. ntg->set_stream_sources(chat_id, Capture, media)
-        // 3. TDLib joinVideoChat(group_call_id, ssrc, payload) -> returns Telegram transport JSON
-        // 4. ntg->connect(chat_id, transport_json, false)
         std::string last_err;
         bool connected = false;
-        for (int attempt = 0; attempt < 3; ++attempt) {
+        for (int attempt = 1; attempt <= 2; ++attempt) {
             try {
                 try { ntg->stop(chat_id); } catch (...) {}
-                std::string local_payload = ntg->create_call(chat_id);
                 ntg->set_stream_sources(chat_id, ntgcalls::media::StreamManager::Mode::Capture, media);
+                std::string local_payload = ntg->create_call(chat_id);
                 int32_t ssrc = extract_ssrc_from_payload(local_payload);
+                LOGGER("AnnieXMedia.core.call").info("📡 Joining group call via TDLib (attempt " + std::to_string(attempt) + ", ssrc=" + std::to_string(ssrc) + ")...");
                 std::string remote_transport = ass->join_group_call_signaling(chat_id, local_payload, ssrc, false, video);
                 ntg->connect(chat_id, remote_transport, false);
+                LOGGER("AnnieXMedia.core.call").info("✅ NTgCalls WebRTC connected and streaming audio in chat " + std::to_string(chat_id));
                 connected = true;
                 break;
             } catch (const std::exception& e) {
                 last_err = e.what();
+                LOGGER("AnnieXMedia.core.call").error("❌ Call connection attempt " + std::to_string(attempt) + " failed in chat " + std::to_string(chat_id) + ": " + last_err);
                 try { ntg->stop(chat_id); } catch (...) {}
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                std::this_thread::sleep_for(std::chrono::milliseconds(800));
             }
         }
         if (!connected) {
@@ -316,7 +290,7 @@ void Call::join_call(int64_t chat_id, int64_t original_chat_id, const std::strin
             utils::database::remove_active_chat(chat_id);
             std::lock_guard<std::mutex> g(global_mtx_);
             joining_chats_.erase(chat_id);
-            throw std::runtime_error(strings::tr(lang, "call_8") + "\n(" + last_err + ")");
+            throw std::runtime_error(strings::tr(lang, "call_8") + "\n<code>" + last_err + "</code>");
         }
     }
 
@@ -356,7 +330,7 @@ void Call::play(std::shared_ptr<ntgcalls::NTgCalls> ntg, std::shared_ptr<Assista
             try { if (ntg) ntg->stop(chat_id); } catch (...) {}
             try { if (ass) ass->leave_group_call_signaling(chat_id, false); } catch (...) {}
             if (config::AUTO_END) {
-                app.send_message(chat_id, "✅ Queue finished. Stream ended automatically.");
+                app.send_message(chat_id, "✅ انتهت قائمة التشغيل وتم مغادرة المكالمة.");
             }
             return;
         }
@@ -367,18 +341,14 @@ void Call::play(std::shared_ptr<ntgcalls::NTgCalls> ntg, std::shared_ptr<Assista
     bool is_video = (next_track.streamtype == "video");
     std::string final_link = next_track.file;
 
-    if (!next_track.vidid.empty() &&
-        (final_link.rfind("vid_", 0) == 0 || final_link.rfind("live_", 0) == 0 ||
-         final_link.rfind("http", 0) == 0 || next_track.streamtype == "youtube" || next_track.streamtype == "live")) {
-        std::string direct = platforms::YouTube.get_direct_link(
-            "https://www.youtube.com/watch?v=" + next_track.vidid, !is_video
-        );
-        if (!direct.empty()) {
-            final_link = direct;
-        }
-    }
-
     try {
+        if (!next_track.vidid.empty() && next_track.vidid != "telegram" &&
+            (final_link.empty() || final_link.rfind("vid_", 0) == 0 || final_link.rfind("https://www.youtube.com", 0) == 0)) {
+            final_link = platforms::YouTube.get_direct_link(
+                "https://www.youtube.com/watch?v=" + next_track.vidid, !is_video
+            );
+        }
+
         auto media = build_native_media_description(final_link, is_video);
         ntg->set_stream_sources(chat_id, ntgcalls::media::StreamManager::Mode::Capture, media);
         if (is_video) utils::database::add_active_video_chat(chat_id);
@@ -391,7 +361,7 @@ void Call::play(std::shared_ptr<ntgcalls::NTgCalls> ntg, std::shared_ptr<Assista
             strings::tr(lang, "stream_1"),
             {
                 "https://t.me/" + app.username + "?start=info_" + next_track.vidid,
-                next_track.title.substr(0, 23),
+                next_track.title.substr(0, 28),
                 next_track.dur,
                 next_track.by
             }
@@ -403,15 +373,15 @@ void Call::play(std::shared_ptr<ntgcalls::NTgCalls> ntg, std::shared_ptr<Assista
             AnnieXMedia::db[chat_id][0].markup = "stream";
         }
     } catch (const std::exception& e) {
-        LOGGER("AnnieXMedia.core.call").error(std::string("Queue Play Error: ") + e.what());
+        LOGGER("AnnieXMedia.core.call").error(std::string("❌ Queue Play Error: ") + e.what());
         clear_queue(chat_id);
         active_calls.erase(chat_id);
-        app.send_message(next_track.chat_id, "❌ Failed to switch stream.");
+        app.send_message(next_track.chat_id, std::string("❌ تعذر تشغيل المقطع التالي:\n<code>") + e.what() + "</code>");
     }
 }
 
 void Call::start() {
-    LOGGER("AnnieXMedia.core.call").info("Starting Native C++ NTgCalls v3.0.3 Clients (Zero PyTgCalls wrapper)...");
+    LOGGER("AnnieXMedia.core.call").info("Starting Native C++ NTgCalls v3.0.3 Clients (Real WebRTC Engine)...");
     if (userbot.one && !config::STRING1.empty()) one = std::make_shared<ntgcalls::NTgCalls>();
     if (userbot.two && !config::STRING2.empty()) two = std::make_shared<ntgcalls::NTgCalls>();
     if (userbot.three && !config::STRING3.empty()) three = std::make_shared<ntgcalls::NTgCalls>();
@@ -437,7 +407,6 @@ void Call::decorators() {
         auto ntg_ptr = p.ntg;
         auto ass_ptr = p.ass;
 
-        // Listen for AUDIO EOF directly from C++ ntgcalls::NTgCalls
         ntg_ptr->on_stream_end([this, ntg_ptr, ass_ptr](
             int64_t chat_id,
             ntgcalls::media::StreamManager::Type type,
@@ -460,7 +429,6 @@ void Call::decorators() {
             this->play(ntg_ptr, ass_ptr, chat_id);
         });
 
-        // Listen for connection close / failure / timeout directly from C++ ntgcalls::NTgCalls
         ntg_ptr->on_connection_change([this](int64_t chat_id, ntgcalls::ConnectionInfo info) {
             if (info.kind == ntgcalls::ConnectionInfo::Kind::Normal) {
                 if (info.state == ntgcalls::ConnectionInfo::State::Closed ||
