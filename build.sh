@@ -9,6 +9,72 @@ JOBS=$(nproc 2>/dev/null || echo 4)
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
+# محاولة تثبيت مكتبة pymongo اختيارياً لحفظ جلسة TDLib في MongoDB تلقائياً عبر عمليات الـ Deploy
+(apt-get update && apt-get install -y --no-install-recommends python3-pymongo python3-dnspython) >/dev/null 2>&1 || true
+
+# إنشاء أداة مزامنة وحفظ جلسة المساعد في MongoDB حتى لا يطلب كود تفعيل عند إعادة التشغيل أو الـ Deploy
+cat << 'PYEOF' > /usr/local/bin/td_session_sync.py
+#!/usr/bin/env python3
+import os, sys, tarfile, io, time
+
+def get_col():
+    uri = os.environ.get("MONGO_DB_URI", "").strip().strip('"').strip("'")
+    if not uri:
+        return None
+    try:
+        import pymongo
+        client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=5000)
+        return client["AnnieMusicBot"]["tdlib_sessions"]
+    except Exception:
+        return None
+
+def backup():
+    col = get_col()
+    if col is None or not os.path.isdir("td_db"):
+        return
+    try:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for root, dirs, files in os.walk("td_db"):
+                for f in files:
+                    if f.endswith(".binlog") or f.endswith(".sqlite") or "td.binlog" in f:
+                        full = os.path.join(root, f)
+                        tar.add(full)
+        data = buf.getvalue()
+        if len(data) > 64:
+            col.update_one(
+                {"_id": "td_db_archive"},
+                {"$set": {"data": data, "updated_at": time.time()}},
+                upsert=True
+            )
+            print("✅ [TDLib Session Sync] Backed up td_db session to MongoDB.")
+    except Exception as e:
+        print(f"⚠️ [TDLib Session Sync] Backup warning: {e}")
+
+def restore():
+    col = get_col()
+    if col is None:
+        return
+    try:
+        doc = col.find_one({"_id": "td_db_archive"})
+        if not doc or "data" not in doc:
+            return
+        buf = io.BytesIO(doc["data"])
+        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+            tar.extractall(".")
+        print("✅ [TDLib Session Sync] Restored td_db session from MongoDB.")
+    except Exception as e:
+        print(f"⚠️ [TDLib Session Sync] Restore warning: {e}")
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "backup":
+        backup()
+    elif cmd == "restore":
+        restore()
+PYEOF
+chmod +x /usr/local/bin/td_session_sync.py || true
+
 # ------------------------------------------------------------------
 # 1. إصلاح ملفات CMakeLists.txt الخاصة بـ TDLib وبناء المكتبة
 # ------------------------------------------------------------------
@@ -61,7 +127,7 @@ class BaseMediaDescription {
 public:
     enum class MediaSource {
         Unknown = 0,
-        File = 1 << 0,
+        File = 0,
         Shell = 1 << 1,
         FFmpeg = 1 << 2,
         Device = 1 << 3,
@@ -311,7 +377,7 @@ cp deps/ntgcalls/lib/libwrtc.a /usr/local/lib/
 echo "✅ [2/3] Native C++ NTgCalls ready."
 
 # ------------------------------------------------------------------
-# 3. تحديث config.cpp لطباعة محتوى السكرتس في اللوج والتشغيل التلقائي ببيانات TDLib المدمجة
+# 3. تحديث config.cpp
 # ------------------------------------------------------------------
 cat << 'EOF' > config.cpp
 #include "config.hpp"
@@ -577,9 +643,9 @@ std::vector<std::string> AYUV = {
 
 std::unordered_set<int64_t> BANNED_USERS;
 std::unordered_map<int64_t, std::vector<int64_t>> adminlist;
+std::unordered_map<int64_t, std::unordered_map<std::string, std::string>> confirmer;
 std::unordered_map<std::string, std::string> lyrical;
 std::vector<std::string> autoclean;
-std::unordered_map<int64_t, std::unordered_map<std::string, std::string>> confirmer;
 std::mutex runtime_mutex;
 
 void init_config() {
@@ -615,9 +681,6 @@ void init_config() {
         API_HASH = raw_api_id;
     }
 
-    // في حال كانت قيمة API_ID أو API_HASH في السكرتس غير صالحة، نستخدم تلقائياً بيانات TDLib الرسمية المدمجة في td_example.cpp:
-    // request->api_id_ = 94575;
-    // request->api_hash_ = "a3406de8d171bb422bb6ddf3bbd800e2";
     if (API_ID <= 0 || API_HASH.size() < 20) {
         std::cout << "⚡ تنبيه: قيمة API_ID أو API_HASH في السكرتس غير قياسية، تم التبديل تلقائياً إلى مفاتيح TDLib الرسمية المدمجة (api_id=94575 من td_example.cpp) لتشغيل البوت فوراً بدون توقف!" << std::endl;
         API_ID = 94575;
@@ -661,7 +724,7 @@ void init_config() {
 
     HEROKU_APP_NAME = getenv_str("HEROKU_APP_NAME", "");
     HEROKU_API_KEY = getenv_str("HEROKU_API_KEY", "");
-    UPSTREAM_REPO = getenv_str("UPSTREAM_REPO", "https://t.me/SourceBoda");
+    UPSTREAM_REPO = getenv_str("UPSTREAM_REPO", "https://t.me/SourceBoda";
     UPSTREAM_BRANCH = getenv_str("UPSTREAM_BRANCH", "Master");
     GIT_TOKEN = getenv_str("GIT_TOKEN", "");
     SUPPORT_CHANNEL = getenv_str("SUPPORT_CHANNEL", "https://t.me/SourceBoda");
@@ -672,7 +735,7 @@ void init_config() {
     SPOTIFY_CLIENT_ID = getenv_str("SPOTIFY_CLIENT_ID", "22b6125bfe224587b722d6815002db2b");
     SPOTIFY_CLIENT_SECRET = getenv_str("SPOTIFY_CLIENT_SECRET", "c9c63c6fbf2f467c8bc68624851e9773");
 
-    STRING1 = raw_session;
+    STRING1 = raw_session.empty() ? "assistant_1" : raw_session;
     STRING2 = getenv_str("STRING_SESSION2", getenv_str("STRING2", ""));
     STRING3 = getenv_str("STRING_SESSION3", getenv_str("STRING3", ""));
     STRING4 = getenv_str("STRING_SESSION4", getenv_str("STRING4", ""));
@@ -693,18 +756,70 @@ void init_config() {
 EOF
 
 # ------------------------------------------------------------------
-# 4. تحديث توافق TDLib 1.8.63 في AnnieXMedia/core/bot.cpp و main.cpp و CMakeLists.txt
+# 4. تحديث AnnieXMedia/core/bot.cpp مع ضمان إرسال رسائل السجل عبر TDLib + Bot API Fallback
 # ------------------------------------------------------------------
 cat << 'EOF' > AnnieXMedia/core/bot.cpp
 #include "AnnieXMedia/core/bot.hpp"
 #include "AnnieXMedia/logging.hpp"
 #include "config.hpp"
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <unistd.h>
 
 namespace AnnieXMedia::core {
 
 MusicBotClient app;
+
+// إرسال احتياطي عبر HTTP Bot API في حال كانت قاعدة بيانات TDLib المحلية جديدة ولم تتعرف على الجروب بعد
+static bool send_via_bot_api_http_single(int64_t target_chat_id, const std::string& html_text,
+                                         int64_t reply_to_message_id, bool disable_preview) {
+    if (config::BOT_TOKEN.empty()) return false;
+    static std::atomic<int> msg_counter{0};
+    std::string tmp_file = "/tmp/annie_msg_" + std::to_string(::getpid()) + "_" + std::to_string(msg_counter.fetch_add(1)) + ".txt";
+    {
+        std::ofstream out(tmp_file, std::ios::binary);
+        if (!out.is_open()) return false;
+        out << html_text;
+    }
+
+    std::string cmd = "curl -s -X POST \"https://api.telegram.org/bot" + config::BOT_TOKEN + "/sendMessage\""
+                      " -d \"chat_id=" + std::to_string(target_chat_id) + "\""
+                      " -d \"parse_mode=HTML\""
+                      " -d \"disable_web_page_preview=" + std::string(disable_preview ? "true" : "false") + "\"";
+    if (reply_to_message_id > 0) {
+        cmd += " -d \"reply_to_message_id=" + std::to_string(reply_to_message_id) + "\"";
+    }
+    cmd += " --data-urlencode \"text@" + tmp_file + "\"";
+
+    std::string output;
+    if (FILE* pipe = ::popen(cmd.c_str(), "r")) {
+        char buf[512];
+        while (std::fgets(buf, sizeof(buf), pipe) != nullptr) {
+            output += buf;
+        }
+        ::pclose(pipe);
+    }
+    std::filesystem::remove(tmp_file);
+    return output.find("\"ok\":true") != std::string::npos;
+}
+
+static bool send_via_bot_api_http(int64_t chat_id, const std::string& html_text,
+                                  int64_t reply_to_message_id = 0, bool disable_preview = true) {
+    if (send_via_bot_api_http_single(chat_id, html_text, reply_to_message_id, disable_preview)) {
+        return true;
+    }
+    // إذا كان LOGGER_ID مكتوباً بصيغة -1004295349964 بينما الجروب الأساسي العادي هو -4295349964 (بدون 100)
+    if (chat_id < -1000000000000LL) {
+        int64_t basic_group_chat_id = -((-chat_id) - 1000000000000LL);
+        if (send_via_bot_api_http_single(basic_group_chat_id, html_text, reply_to_message_id, disable_preview)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 MusicBotClient::MusicBotClient() {
     td::ClientManager::execute(td_api::make_object<td_api::setLogVerbosityLevel>(1));
@@ -980,13 +1095,13 @@ void MusicBotClient::start() {
         this->username = config::BOT_USERNAME;
     }
 
-    send_message(
-        config::LOGGER_ID,
+    std::string start_msg =
         "<u><b>» " + this->mention + " ʙᴏᴛ sᴛᴀʀᴛᴇᴅ (C++ TDLib & Native NTgCalls) :</b></u>\n\n"
         "ɪᴅ : <code>" + std::to_string(this->id) + "</code>\n"
         "ɴᴀᴍᴇ : " + this->name + "\n"
-        "ᴜsᴇʀɴᴀᴍᴇ : @" + this->username
-    );
+        "ᴜsᴇʀɴᴀᴍᴇ : @" + this->username;
+
+    send_message(config::LOGGER_ID, start_msg);
 
     LOGGER("AnnieXMedia.core.bot").info("✅ Music Bot started as " + this->name + " (@" + this->username + ")");
 }
@@ -1053,6 +1168,16 @@ int64_t MusicBotClient::send_message(int64_t chat_id, const std::string& text,
                                      const InlineKeyboardMarkup& reply_markup,
                                      int64_t reply_to_message_id,
                                      bool disable_web_page_preview) {
+    // محاولة تهيئة الشات في قاعدة بيانات TDLib المحلية أولاً
+    if (chat_id > 0) {
+        send_query(td_api::make_object<td_api::createPrivateChat>(chat_id, true));
+    } else if (chat_id < -1000000000000LL) {
+        int64_t sg_id = (-chat_id) - 1000000000000LL;
+        send_query(td_api::make_object<td_api::createSupergroupChat>(sg_id, true));
+    } else if (chat_id < 0) {
+        send_query(td_api::make_object<td_api::createBasicGroupChat>(-chat_id, true));
+    }
+
     auto req = td_api::make_object<td_api::sendMessage>();
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
@@ -1071,9 +1196,17 @@ int64_t MusicBotClient::send_message(int64_t chat_id, const std::string& text,
     }
     req->input_message_content_ = std::move(content);
 
-    auto resp = send_query_sync(std::move(req), 8);
+    auto resp = send_query_sync(std::move(req), 5);
     if (resp && resp->get_id() == td_api::message::ID) {
         return static_cast<const td_api::message*>(resp.get())->id_;
+    }
+
+    // في حال كانت الجلسة جديدة ولم يتعرف TDLib على الشات بعد، نرسل فوراً عبر Bot API HTTP
+    if (send_via_bot_api_http(chat_id, text, reply_to_message_id, disable_web_page_preview)) {
+        return 1;
+    }
+    if (chat_id == config::LOGGER_ID && config::OWNER_ID != 0 && config::OWNER_ID != chat_id) {
+        send_via_bot_api_http(config::OWNER_ID, text, 0, disable_web_page_preview);
     }
     return 0;
 }
@@ -1460,6 +1593,566 @@ std::string MusicBotClient::download_file(const std::string& remote_file_id) {
 } // namespace AnnieXMedia::core
 EOF
 
+# ------------------------------------------------------------------
+# 5. تحديث AnnieXMedia/core/userbot.hpp و AnnieXMedia/core/userbot.cpp
+#    بحيث لا يكتب "تم تشغيل المساعد" إلا بعد اكتمال تسجيل الدخول الفعلي ويرسل تنبيهاً في جروب السجل
+# ------------------------------------------------------------------
+cat << 'EOF' > AnnieXMedia/core/userbot.hpp
+#pragma once
+
+#include <td/telegram/Client.h>
+#include <td/telegram/td_api.h>
+#include <td/telegram/td_api.hpp>
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <future>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace AnnieXMedia::core {
+
+namespace td_api = td::td_api;
+
+extern std::vector<int> assistants;
+extern std::vector<int64_t> assistantids;
+
+class AssistantClient {
+    int index_;
+    std::string session_config_;
+    std::unique_ptr<td::ClientManager> client_manager_;
+    int32_t client_id_{0};
+    std::atomic<uint64_t> query_id_{1};
+    std::atomic<bool> running_{false};
+    std::atomic<bool> authorized_{false};
+    std::atomic<bool> waiting_code_{false};
+    std::atomic<bool> waiting_password_{false};
+    std::atomic<bool> finalized_{false};
+    std::mutex mtx_;
+    std::map<uint64_t, std::function<void(td_api::object_ptr<td_api::Object>)>> callbacks_;
+    std::map<int64_t, int32_t> chat_group_call_ids_;
+    std::thread worker_;
+
+    void process_response(td::ClientManager::Response response);
+    void on_auth_state(td_api::object_ptr<td_api::AuthorizationState> state);
+
+public:
+    int64_t id = 0;
+    std::string name;
+    std::string username;
+
+    AssistantClient(int index, std::string session_config);
+    ~AssistantClient();
+
+    void send_query(td_api::object_ptr<td_api::Function> f,
+                    std::function<void(td_api::object_ptr<td_api::Object>)> cb = {});
+    td_api::object_ptr<td_api::Object> send_query_sync(td_api::object_ptr<td_api::Function> f, int timeout_sec = 10);
+
+    bool start();
+    void stop();
+    void finalize_authorization();
+    bool is_active() const { return running_.load(); }
+    bool is_authorized() const { return authorized_.load(); }
+    bool is_waiting_code() const { return waiting_code_.load(); }
+    bool is_waiting_password() const { return waiting_password_.load(); }
+
+    int32_t get_or_create_group_call_id(int64_t chat_id, bool auto_create = true);
+    std::string join_group_call_signaling(int64_t chat_id, const std::string& join_payload_json,
+                                          int32_t audio_source_ssrc, bool is_muted, bool is_video_enabled);
+    bool leave_group_call_signaling(int64_t chat_id, bool end_call = false);
+    bool set_call_volume(int64_t chat_id, int volume_percent);
+    std::vector<int64_t> get_call_participants(int64_t chat_id);
+    bool join_chat_by_link_or_username(const std::string& link_or_username);
+    bool leave_chat(int64_t chat_id);
+    void send_message(int64_t chat_id, const std::string& text);
+};
+
+class Userbot {
+public:
+    std::shared_ptr<AssistantClient> one;
+    std::shared_ptr<AssistantClient> two;
+    std::shared_ptr<AssistantClient> three;
+    std::shared_ptr<AssistantClient> four;
+    std::shared_ptr<AssistantClient> five;
+
+    Userbot();
+    void start();
+    void stop();
+    std::shared_ptr<AssistantClient> get_by_index(int index) const;
+};
+
+extern Userbot userbot;
+
+} // namespace AnnieXMedia::core
+EOF
+
+cat << 'EOF' > AnnieXMedia/core/userbot.cpp
+#include "AnnieXMedia/core/userbot.hpp"
+#include "AnnieXMedia/core/bot.hpp"
+#include "AnnieXMedia/logging.hpp"
+#include "config.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+#include <regex>
+
+namespace AnnieXMedia::core {
+
+std::vector<int> assistants;
+std::vector<int64_t> assistantids;
+Userbot userbot;
+
+AssistantClient::AssistantClient(int index, std::string session_config)
+    : index_(index), session_config_(std::move(session_config)) {
+    client_manager_ = std::make_unique<td::ClientManager>();
+    client_id_ = client_manager_->create_client_id();
+}
+
+AssistantClient::~AssistantClient() {
+    stop();
+}
+
+void AssistantClient::send_query(td_api::object_ptr<td_api::Function> f,
+                                 std::function<void(td_api::object_ptr<td_api::Object>)> cb) {
+    uint64_t qid = query_id_.fetch_add(1);
+    if (cb) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        callbacks_[qid] = std::move(cb);
+    }
+    client_manager_->send(client_id_, qid, std::move(f));
+}
+
+td_api::object_ptr<td_api::Object> AssistantClient::send_query_sync(td_api::object_ptr<td_api::Function> f, int timeout_sec) {
+    auto prom = std::make_shared<std::promise<td_api::object_ptr<td_api::Object>>>();
+    auto fut = prom->get_future();
+    send_query(std::move(f), [prom](td_api::object_ptr<td_api::Object> obj) {
+        try { prom->set_value(std::move(obj)); } catch (...) {}
+    });
+    if (fut.wait_for(std::chrono::seconds(timeout_sec)) == std::future_status::ready) {
+        return fut.get();
+    }
+    return nullptr;
+}
+
+void AssistantClient::finalize_authorization() {
+    if (finalized_.exchange(true)) return;
+
+    auto me_obj = send_query_sync(td_api::make_object<td_api::getMe>(), 8);
+    if (me_obj && me_obj->get_id() == td_api::user::ID) {
+        auto me = td_api::move_object_as<td_api::user>(me_obj);
+        id = me->id_;
+        name = me->first_name_ + (me->last_name_.empty() ? "" : (" " + me->last_name_));
+        if (me->usernames_ && !me->usernames_->active_usernames_.empty()) {
+            username = me->usernames_->active_usernames_[0];
+        } else {
+            username = config::ASSUSERNAME;
+        }
+    } else {
+        name = "AnnieAssis" + std::to_string(index_);
+        username = config::ASSUSERNAME;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (std::find(assistants.begin(), assistants.end(), index_) == assistants.end()) {
+            assistants.push_back(index_);
+        }
+        if (id != 0 && std::find(assistantids.begin(), assistantids.end(), id) == assistantids.end()) {
+            assistantids.push_back(id);
+        }
+    }
+
+    LOGGER("AnnieXMedia.core.userbot").info(
+        "☔ تم تشغيل المساعد " + std::to_string(index_) + " بنجاح بهوية: " + name + " (@" + username + ") [ID: " + std::to_string(id) + "]"
+    );
+
+    // حفظ جلسة TDLib في MongoDB تلقائياً حتى لا يطلب كود تفعيل مرة أخرى عند عمل Deploy جديد
+    std::system("python3 /usr/local/bin/td_session_sync.py backup >/dev/null 2>&1 &");
+
+    // إرسال رسالة تأكيد تشغيل المساعد في جروب السجل (LOGGER_ID) عبر البوت وعبر المساعد نفسه
+    std::string log_msg =
+        "<u><b>☔ تم تشغيل الحساب المساعد " + std::to_string(index_) + " بنجاح :</b></u>\n\n"
+        "• <b>الاسم :</b> " + name + "\n"
+        "• <b>الآيدي :</b> <code>" + std::to_string(id) + "</code>\n"
+        "• <b>اليوزر :</b> @" + username + "\n"
+        "• <b>الحالة :</b> متصل وجاهز لتشغيل الميديا في المكالمات 🤍";
+
+    app.send_message(config::LOGGER_ID, log_msg);
+    send_message(config::LOGGER_ID, "☔ تم بدء تشغيل الحساب المساعد " + std::to_string(index_) + " (" + name + ") بنجاح 🤍");
+}
+
+void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationState> state) {
+    if (!state) return;
+    switch (state->get_id()) {
+        case td_api::authorizationStateWaitTdlibParameters::ID: {
+            std::string db_dir = "td_db/assistant_" + std::to_string(index_);
+            std::filesystem::create_directories(db_dir);
+            auto req = td_api::make_object<td_api::setTdlibParameters>();
+            req->database_directory_ = db_dir;
+            req->use_message_database_ = true;
+            req->use_secret_chats_ = false;
+            req->api_id_ = config::API_ID > 0 ? config::API_ID : 94575;
+            req->api_hash_ = config::API_HASH.size() >= 20 ? config::API_HASH : "a3406de8d171bb422bb6ddf3bbd800e2";
+            req->system_language_code_ = "ar";
+            req->device_model_ = "AnnieAssis" + std::to_string(index_);
+            req->system_version_ = "Linux";
+            req->application_version_ = "3.0.0";
+            send_query(std::move(req));
+            break;
+        }
+        case td_api::authorizationStateWaitPhoneNumber::ID: {
+            std::string phone_env = config::getenv_str(("ASSISTANT_PHONE" + std::to_string(index_)).c_str(), "");
+            if (phone_env.empty() && !session_config_.empty() && (session_config_[0] == '+' || std::isdigit(static_cast<unsigned char>(session_config_[0])))) {
+                phone_env = session_config_;
+            }
+            if (!phone_env.empty()) {
+                if (phone_env[0] != '+') phone_env = "+" + phone_env;
+                LOGGER("AnnieXMedia.core.userbot").info("📲 جارٍ إرسال رقم هاتف المساعد " + std::to_string(index_) + " (" + phone_env + ") لطلب كود التفعيل...");
+                send_query(td_api::make_object<td_api::setAuthenticationPhoneNumber>(phone_env, nullptr),
+                           [this, phone_env](td_api::object_ptr<td_api::Object> obj) {
+                               if (obj && obj->get_id() == td_api::error::ID) {
+                                   auto* err = static_cast<const td_api::error*>(obj.get());
+                                   LOGGER("AnnieXMedia.core.userbot").error("❌ خطأ في رقم هاتف المساعد: " + err->message_);
+                                   app.send_message(config::LOGGER_ID,
+                                       "❌ <b>خطأ في رقم هاتف الحساب المساعد (" + phone_env + "):</b>\n<code>" + err->message_ + "</code>\n"
+                                       "أرسل الرقم الصحيح في شات البوت بالأمر:\n<code>/assphone +201xxxxxxxxx</code>");
+                               }
+                           });
+            } else {
+                LOGGER("AnnieXMedia.core.userbot").warning(
+                    "💝 المساعد " + std::to_string(index_) +
+                    ": أرسل رقم هاتف المساعد في شات البوت بالأمر: /assphone +201xxxxxxxxx"
+                );
+            }
+            break;
+        }
+        case td_api::authorizationStateWaitCode::ID: {
+            waiting_code_.store(true);
+            waiting_password_.store(false);
+            LOGGER("AnnieXMedia.core.userbot").warning(
+                "📲 المساعد " + std::to_string(index_) + " بانتظار كود التفعيل! أرسل الكود الآن في جروب السجل أو في خاص البوت: كود المساعد 1 2 3 4 5"
+            );
+            std::thread([idx = index_]() {
+                std::string prompt_msg =
+                    "📲 <b>تم إرسال كود تسجيل الدخول للحساب المساعد (" + std::to_string(idx) + ") على تيليجرام!</b>\n\n"
+                    "⚠️ <b>تنبيه هام:</b> لا تضع الكود في السكرتس ولا تعمل Deploy (لأن عمل Deploy يعيد تشغيل الماشين ويلغي الكود الحالي).\n\n"
+                    "✍️ <b>فقط أرسل الكود الآن هنا في جروب السجل أو في خاص البوت</b> مفصولاً بمسافات هكذا:\n"
+                    "<code>كود المساعد 1 2 3 4 5</code>\n"
+                    "أو:\n"
+                    "<code>/asscode 1 2 3 4 5</code>";
+                app.send_message(config::LOGGER_ID, prompt_msg);
+                if (config::OWNER_ID != 0 && config::OWNER_ID != config::LOGGER_ID) {
+                    app.send_message(config::OWNER_ID, prompt_msg);
+                }
+            }).detach();
+            break;
+        }
+        case td_api::authorizationStateWaitPassword::ID: {
+            waiting_code_.store(false);
+            waiting_password_.store(true);
+            std::string pass_env = config::getenv_str(("ASSISTANT_PASSWORD" + std::to_string(index_)).c_str(), "");
+            if (!pass_env.empty()) {
+                send_query(td_api::make_object<td_api::checkAuthenticationPassword>(pass_env));
+            } else {
+                LOGGER("AnnieXMedia.core.userbot").warning(
+                    "🔐 المساعد " + std::to_string(index_) + " محمي بكلمة مرور التحقق بخطوتين (2FA)! أرسل في شات البوت: باسورد المساعد كلمه_السر"
+                );
+                std::thread([idx = index_]() {
+                    std::string pwd_msg =
+                        "🔐 <b>الحساب المساعد (" + std::to_string(idx) + ") محمي بكلمة مرور التحقق بخطوتين (2FA)!</b>\n\n"
+                        "أرسل كلمة المرور الآن هنا في جروب السجل أو في خاص البوت هكذا:\n"
+                        "<code>باسورد المساعد كلمه_السر</code>\n"
+                        "أو:\n"
+                        "<code>/asspass كلمه_السر</code>";
+                    app.send_message(config::LOGGER_ID, pwd_msg);
+                    if (config::OWNER_ID != 0 && config::OWNER_ID != config::LOGGER_ID) {
+                        app.send_message(config::OWNER_ID, pwd_msg);
+                    }
+                }).detach();
+            }
+            break;
+        }
+        case td_api::authorizationStateReady::ID: {
+            waiting_code_.store(false);
+            waiting_password_.store(false);
+            authorized_.store(true);
+            std::thread([this]() {
+                this->finalize_authorization();
+            }).detach();
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+void AssistantClient::process_response(td::ClientManager::Response response) {
+    if (!response.object) return;
+    if (response.request_id == 0) {
+        if (response.object->get_id() == td_api::updateAuthorizationState::ID) {
+            auto u = td_api::move_object_as<td_api::updateAuthorizationState>(response.object);
+            on_auth_state(std::move(u->authorization_state_));
+        } else if (response.object->get_id() == td_api::updateChatVideoChat::ID) {
+            auto u = td_api::move_object_as<td_api::updateChatVideoChat>(response.object);
+            if (u->video_chat_) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                chat_group_call_ids_[u->chat_id_] = u->video_chat_->group_call_id_;
+            }
+        }
+        return;
+    }
+    std::function<void(td_api::object_ptr<td_api::Object>)> cb;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = callbacks_.find(response.request_id);
+        if (it != callbacks_.end()) {
+            cb = std::move(it->second);
+            callbacks_.erase(it);
+        }
+    }
+    if (cb) cb(std::move(response.object));
+}
+
+bool AssistantClient::start() {
+    if (session_config_.empty()) return false;
+    running_.store(true);
+    send_query(td_api::make_object<td_api::getOption>("version"));
+
+    worker_ = std::thread([this]() {
+        while (running_.load()) {
+            auto resp = client_manager_->receive(1.0);
+            if (resp.object) process_response(std::move(resp));
+        }
+    });
+
+    for (int i = 0; i < 60 && !authorized_.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (authorized_.load()) {
+        finalize_authorization();
+    } else {
+        LOGGER("AnnieXMedia.core.userbot").info(
+            "⏳ المساعد " + std::to_string(index_) + " ينتظر إدخال كود التفعيل من تيليجرام (أرسل الكود في شات البوت أو جروب السجل بدون عمل Deploy)..."
+        );
+    }
+    return true;
+}
+
+void AssistantClient::stop() {
+    if (!running_.exchange(false)) return;
+    send_query(td_api::make_object<td_api::close>());
+    if (worker_.joinable()) worker_.join();
+}
+
+int32_t AssistantClient::get_or_create_group_call_id(int64_t chat_id, bool auto_create) {
+    auto chat_obj = send_query_sync(td_api::make_object<td_api::getChat>(chat_id), 8);
+    if (chat_obj && chat_obj->get_id() == td_api::chat::ID) {
+        auto* c = static_cast<const td_api::chat*>(chat_obj.get());
+        if (c->video_chat_ && c->video_chat_->group_call_id_ != 0) {
+            std::lock_guard<std::mutex> lock(mtx_);
+            chat_group_call_ids_[chat_id] = c->video_chat_->group_call_id_;
+            return c->video_chat_->group_call_id_;
+        }
+    }
+    if (auto_create) {
+        auto created = send_query_sync(td_api::make_object<td_api::createVideoChat>(chat_id, config::BOT_NAME, 0, false), 8);
+        if (created && created->get_id() == td_api::groupCallId::ID) {
+            int32_t gcid = static_cast<const td_api::groupCallId*>(created.get())->id_;
+            std::lock_guard<std::mutex> lock(mtx_);
+            chat_group_call_ids_[chat_id] = gcid;
+            return gcid;
+        }
+    }
+    return 0;
+}
+
+std::string AssistantClient::join_group_call_signaling(int64_t chat_id, const std::string& join_payload_json,
+                                                       int32_t audio_source_ssrc, bool is_muted, bool is_video_enabled) {
+    int32_t group_call_id = get_or_create_group_call_id(chat_id, true);
+    if (group_call_id == 0) {
+        throw std::runtime_error("Group call not found or could not be initialized");
+    }
+
+    auto join_params = td_api::make_object<td_api::groupCallJoinParameters>(
+        audio_source_ssrc,
+        join_payload_json,
+        is_muted,
+        is_video_enabled
+    );
+
+    td_api::object_ptr<td_api::MessageSender> participant_id = nullptr;
+    if (this->id != 0) {
+        participant_id = td_api::make_object<td_api::messageSenderUser>(this->id);
+    }
+
+    auto req = td_api::make_object<td_api::joinVideoChat>(
+        group_call_id,
+        std::move(participant_id),
+        std::move(join_params),
+        ""
+    );
+
+    auto resp = send_query_sync(std::move(req), 10);
+    if (resp && resp->get_id() == td_api::text::ID) {
+        return static_cast<const td_api::text*>(resp.get())->text_;
+    }
+    if (resp && resp->get_id() == td_api::error::ID) {
+        auto* err = static_cast<const td_api::error*>(resp.get());
+        throw std::runtime_error("TDLib joinVideoChat error: " + err->message_);
+    }
+    throw std::runtime_error("Failed to receive transport payload from joinVideoChat");
+}
+
+bool AssistantClient::leave_group_call_signaling(int64_t chat_id, bool end_call) {
+    int32_t gcid = 0;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = chat_group_call_ids_.find(chat_id);
+        if (it != chat_group_call_ids_.end()) gcid = it->second;
+    }
+    if (gcid == 0) gcid = get_or_create_group_call_id(chat_id, false);
+    if (gcid == 0) return false;
+
+    if (end_call) {
+        auto r = send_query_sync(td_api::make_object<td_api::endGroupCall>(gcid), 5);
+        return r && r->get_id() == td_api::ok::ID;
+    } else {
+        auto r = send_query_sync(td_api::make_object<td_api::leaveGroupCall>(gcid), 5);
+        return r && r->get_id() == td_api::ok::ID;
+    }
+}
+
+bool AssistantClient::set_call_volume(int64_t chat_id, int volume_percent) {
+    int32_t gcid = get_or_create_group_call_id(chat_id, false);
+    if (gcid == 0) return false;
+    int32_t td_vol = std::max(100, std::min(20000, volume_percent * 100));
+    auto participant = td_api::make_object<td_api::messageSenderUser>(this->id);
+    auto r = send_query_sync(
+        td_api::make_object<td_api::setGroupCallParticipantVolumeLevel>(gcid, std::move(participant), td_vol), 5
+    );
+    return r && r->get_id() == td_api::ok::ID;
+}
+
+std::vector<int64_t> AssistantClient::get_call_participants(int64_t chat_id) {
+    std::vector<int64_t> res;
+    int32_t gcid = get_or_create_group_call_id(chat_id, false);
+    if (gcid == 0) return res;
+    send_query_sync(td_api::make_object<td_api::loadGroupCallParticipants>(gcid, 100), 5);
+    auto gc = send_query_sync(td_api::make_object<td_api::getGroupCall>(gcid), 5);
+    if (gc && gc->get_id() == td_api::groupCall::ID) {
+        auto* g = static_cast<const td_api::groupCall*>(gc.get());
+        for (const auto& sp : g->recent_speakers_) {
+            if (sp && sp->participant_id_ && sp->participant_id_->get_id() == td_api::messageSenderUser::ID) {
+                res.push_back(static_cast<const td_api::messageSenderUser*>(sp->participant_id_.get())->user_id_);
+            }
+        }
+    }
+    return res;
+}
+
+bool AssistantClient::join_chat_by_link_or_username(const std::string& link_or_username) {
+    if (link_or_username.find("t.me/") != std::string::npos || link_or_username.find("http") != std::string::npos) {
+        auto r = send_query_sync(td_api::make_object<td_api::joinChatByInviteLink>(link_or_username), 8);
+        return r && r->get_id() == td_api::chat::ID;
+    }
+    std::string clean = link_or_username;
+    if (!clean.empty() && clean[0] == '@') clean.erase(clean.begin());
+    auto pub = send_query_sync(td_api::make_object<td_api::searchPublicChat>(clean), 8);
+    if (pub && pub->get_id() == td_api::chat::ID) {
+        int64_t cid = static_cast<const td_api::chat*>(pub.get())->id_;
+        auto r = send_query_sync(td_api::make_object<td_api::joinChat>(cid), 8);
+        return r && r->get_id() == td_api::ok::ID;
+    }
+    return false;
+}
+
+bool AssistantClient::leave_chat(int64_t chat_id) {
+    auto r = send_query_sync(td_api::make_object<td_api::leaveChat>(chat_id), 5);
+    return r && r->get_id() == td_api::ok::ID;
+}
+
+void AssistantClient::send_message(int64_t chat_id, const std::string& text) {
+    if (chat_id > 0) {
+        send_query(td_api::make_object<td_api::createPrivateChat>(chat_id, true));
+    } else if (chat_id < -1000000000000LL) {
+        int64_t sg_id = (-chat_id) - 1000000000000LL;
+        send_query(td_api::make_object<td_api::createSupergroupChat>(sg_id, true));
+    } else if (chat_id < 0) {
+        send_query(td_api::make_object<td_api::createBasicGroupChat>(-chat_id, true));
+    }
+    auto req = td_api::make_object<td_api::sendMessage>();
+    req->chat_id_ = chat_id;
+    auto content = td_api::make_object<td_api::inputMessageText>();
+    auto ft = td_api::make_object<td_api::formattedText>();
+    ft->text_ = text;
+    content->text_ = std::move(ft);
+    req->input_message_content_ = std::move(content);
+    send_query(std::move(req));
+}
+
+Userbot::Userbot() = default;
+
+void Userbot::start() {
+    // استرجاع جلسة المساعد المحفوظة في MongoDB إن وجدت قبل بدء TDLib
+    std::system("python3 /usr/local/bin/td_session_sync.py restore >/dev/null 2>&1");
+
+    LOGGER("AnnieXMedia.core.userbot").info("💝 جارٍ بدء تشغيل حسابات المساعدين (TDLib Native)...");
+    if (!config::STRING1.empty()) {
+        one = std::make_shared<AssistantClient>(1, config::STRING1);
+        one->start();
+    }
+    if (!config::STRING2.empty()) {
+        two = std::make_shared<AssistantClient>(2, config::STRING2);
+        two->start();
+    }
+    if (!config::STRING3.empty()) {
+        three = std::make_shared<AssistantClient>(3, config::STRING3);
+        three->start();
+    }
+    if (!config::STRING4.empty()) {
+        four = std::make_shared<AssistantClient>(4, config::STRING4);
+        four->start();
+    }
+    if (!config::STRING5.empty()) {
+        five = std::make_shared<AssistantClient>(5, config::STRING5);
+        five->start();
+    }
+}
+
+void Userbot::stop() {
+    LOGGER("AnnieXMedia.core.userbot").info("☔ جارٍ إيقاف المساعدين...");
+    if (one) one->stop();
+    if (two) two->stop();
+    if (three) three->stop();
+    if (four) four->stop();
+    if (five) five->stop();
+}
+
+std::shared_ptr<AssistantClient> Userbot::get_by_index(int index) const {
+    switch (index) {
+        case 1: return one;
+        case 2: return two;
+        case 3: return three;
+        case 4: return four;
+        case 5: return five;
+        default: return one;
+    }
+}
+
+} // namespace AnnieXMedia::core
+EOF
+
+# ------------------------------------------------------------------
+# 6. تحديث AnnieXMedia/main.cpp لدعم إدخال الكود مباشرة من شات البوت أو جروب السجل بدون Deploy
+# ------------------------------------------------------------------
 cat << 'EOF' > AnnieXMedia/main.cpp
 // ── 𝚂ᴏᴜʀᴄᴇ ✘ 𝐁ᴏᴅᴀ © 2026 (C++20 Edition - TDLib & Native NTgCalls) ──────────
 #include "config.hpp"
@@ -1515,6 +2208,142 @@ static void start_healthcheck_server() {
     }).detach();
 }
 
+// تسجيل أوامر تفاعلية لتسجيل دخول الحساب المساعد في TDLib مباشرة من شات البوت أو جروب السجل بدون الحاجة لتعديل السكرتس
+static void register_assistant_login_commands() {
+    core::app.on_message([](const core::IncomingMessage& msg) -> bool {
+        bool is_authorized_user = (msg.sender_user_id == config::OWNER_ID ||
+                                   SUDOERS.count(msg.sender_user_id) > 0 ||
+                                   msg.chat_id == config::LOGGER_ID);
+        if (!is_authorized_user) return false;
+
+        std::string t = msg.text;
+        if (t.empty()) return false;
+
+        auto extract_arg = [](const std::string& s, const std::string& prefix) -> std::string {
+            if (s.rfind(prefix, 0) != 0) return "";
+            std::string rest = s.substr(prefix.size());
+            while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) rest.erase(rest.begin());
+            while (!rest.empty() && (rest.back() == ' ' || rest.back() == '\t' || rest.back() == '\r' || rest.back() == '\n')) rest.pop_back();
+            return rest;
+        };
+
+        std::string phone = extract_arg(t, "/assphone");
+        if (phone.empty()) phone = extract_arg(t, "رقم المساعد");
+        if (!phone.empty()) {
+            if (phone[0] != '+') phone = "+" + phone;
+            if (!core::userbot.one) {
+                core::userbot.one = std::make_shared<core::AssistantClient>(1, phone);
+                core::userbot.one->start();
+            }
+            auto r = core::userbot.one->send_query_sync(
+                core::td_api::make_object<core::td_api::setAuthenticationPhoneNumber>(phone, nullptr), 10
+            );
+            if (r && r->get_id() == core::td_api::error::ID) {
+                auto* err = static_cast<const core::td_api::error*>(r.get());
+                core::app.send_message(msg.chat_id, "❌ خطأ من تيليجرام أثناء إرسال الرقم:\n<code>" + err->message_ + "</code>", {}, msg.id);
+            } else {
+                core::app.send_message(
+                    msg.chat_id,
+                    "📲 <b>تم إرسال كود التفعيل إلى رقم المساعد (" + phone + ") على تيليجرام!</b>\n\n"
+                    "أرسل الكود الآن هنا في الشات مفصولاً بمسافات (بدون تعديل السكرتس وبدون عمل Deploy) هكذا:\n"
+                    "<code>كود المساعد 1 2 3 4 5</code>",
+                    {}, msg.id
+                );
+            }
+            return true;
+        }
+
+        std::string code = extract_arg(t, "/asscode");
+        if (code.empty()) code = extract_arg(t, "كود المساعد");
+        // إذا كان المساعد بانتظار الكود وأرسل المالك الكود مباشرة كأرقام (مثال: 1 2 3 4 5)
+        if (code.empty() && core::userbot.one && core::userbot.one->is_waiting_code()) {
+            std::string trimmed = t;
+            bool only_digits_and_spaces = !trimmed.empty() && std::all_of(trimmed.begin(), trimmed.end(), [](unsigned char c) {
+                return std::isdigit(c) || c == ' ' || c == '-';
+            });
+            if (only_digits_and_spaces) {
+                std::string d;
+                for (char c : trimmed) if (std::isdigit(static_cast<unsigned char>(c))) d.push_back(c);
+                if (d.size() >= 4 && d.size() <= 6) {
+                    code = d;
+                }
+            }
+        }
+
+        if (!code.empty()) {
+            std::string digits_only;
+            for (char c : code) {
+                if (std::isdigit(static_cast<unsigned char>(c))) digits_only.push_back(c);
+            }
+            if (!core::userbot.one || digits_only.empty()) {
+                core::app.send_message(msg.chat_id, "⚠️ أرسل رقم الهاتف أولاً بالأمر:\n<code>/assphone +201xxxxxxxxx</code>", {}, msg.id);
+                return true;
+            }
+            auto r = core::userbot.one->send_query_sync(
+                core::td_api::make_object<core::td_api::checkAuthenticationCode>(digits_only), 10
+            );
+            if (r && r->get_id() == core::td_api::error::ID) {
+                auto* err = static_cast<const core::td_api::error*>(r.get());
+                core::app.send_message(msg.chat_id, "❌ الكود غير صحيح أو انتهت صلاحيته:\n<code>" + err->message_ + "</code>", {}, msg.id);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(800));
+                if (core::userbot.one->is_authorized()) {
+                    core::userbot.one->finalize_authorization();
+                    core::app.send_message(
+                        msg.chat_id,
+                        "✅ <b>تم تسجيل دخول وتشغيل الحساب المساعد بنجاح!</b>\n"
+                        "• الاسم: " + core::userbot.one->name + "\n"
+                        "• الآيدي: <code>" + std::to_string(core::userbot.one->id) + "</code>\n"
+                        "• اليوزر: @" + core::userbot.one->username,
+                        {}, msg.id
+                    );
+                } else {
+                    core::app.send_message(
+                        msg.chat_id,
+                        "🔐 <b>تم قبول الكود!</b>\n"
+                        "إذا كان الحساب محمياً بكلمة مرور التحقق بخطوتين (2FA)، أرسلها الآن هكذا:\n"
+                        "<code>باسورد المساعد كلمه_السر</code>\n"
+                        "أو:\n"
+                        "<code>/asspass كلمه_السر</code>",
+                        {}, msg.id
+                    );
+                }
+            }
+            return true;
+        }
+
+        std::string pass = extract_arg(t, "/asspass");
+        if (pass.empty()) pass = extract_arg(t, "باسورد المساعد");
+        if (!pass.empty()) {
+            if (!core::userbot.one) {
+                core::app.send_message(msg.chat_id, "⚠️ أرسل رقم الهاتف والكود أولاً.", {}, msg.id);
+                return true;
+            }
+            auto r = core::userbot.one->send_query_sync(
+                core::td_api::make_object<core::td_api::checkAuthenticationPassword>(pass), 10
+            );
+            if (r && r->get_id() == core::td_api::error::ID) {
+                auto* err = static_cast<const core::td_api::error*>(r.get());
+                core::app.send_message(msg.chat_id, "❌ كلمة المرور غير صحيحة:\n<code>" + err->message_ + "</code>", {}, msg.id);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(800));
+                core::userbot.one->finalize_authorization();
+                core::app.send_message(
+                    msg.chat_id,
+                    "✅ <b>تم تسجيل دخول وتشغيل الحساب المساعد بنجاح!</b>\n"
+                    "• الاسم: " + core::userbot.one->name + "\n"
+                    "• الآيدي: <code>" + std::to_string(core::userbot.one->id) + "</code>\n"
+                    "• اليوزر: @" + core::userbot.one->username,
+                    {}, msg.id
+                );
+            }
+            return true;
+        }
+
+        return false;
+    });
+}
+
 static void signal_handler(int signum) {
     (void)signum;
     LOGGER("AnnieXMedia").info("🛑 Bot process killed by user (SIGINT/SIGTERM). Stopping services...");
@@ -1547,11 +2376,6 @@ int main() {
 
     LOGGER("AnnieXMedia").info("🚀 Starting Annie Music Bot (C++20 Native TDLib & NTgCalls Engine)...");
 
-    if (config::STRING1.empty() && config::STRING2.empty() && config::STRING3.empty() &&
-        config::STRING4.empty() && config::STRING5.empty()) {
-        LOGGER("AnnieXMedia").warning("⚠️ لم يتم وضع STRING_SESSION، سيعمل البوت الأساسي بدون حساب مساعد لحين إضافته.");
-    }
-
     // 3. Load YouTube cookies if COOKIE_URL is provided
     try {
         utils::fetch_and_store_cookies();
@@ -1568,8 +2392,9 @@ int main() {
         config::BANNED_USERS.insert(uid);
     }
 
-    // 5. Start TDLib Bot Client & register all C++ plugins
+    // 5. Start TDLib Bot Client & register all C++ plugins + interactive Assistant login commands
     core::app.start();
+    register_assistant_login_commands();
     plugins::register_all_plugins();
 
     // 6. Start TDLib Assistant Userbots & Native C++ NTgCalls StreamController
@@ -1670,7 +2495,7 @@ target_link_libraries(annie_music_bot PRIVATE
 EOF
 
 # ------------------------------------------------------------------
-# 5. ترجمة وبناء البوت النهائي (annie_music_bot)
+# 7. ترجمة وبناء البوت النهائي (annie_music_bot)
 # ------------------------------------------------------------------
 echo "⚙️ [3/3] Compiling AnnieXBoda C++20 Bot executable..."
 rm -rf build
