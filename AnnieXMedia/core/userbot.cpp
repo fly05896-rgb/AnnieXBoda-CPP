@@ -17,6 +17,7 @@ Userbot userbot;
 
 AssistantClient::AssistantClient(int index, std::string session_config)
     : index_(index), session_config_(std::move(session_config)) {
+    td::ClientManager::execute(td_api::make_object<td_api::setLogVerbosityLevel>(0));
     client_manager_ = std::make_unique<td::ClientManager>();
     client_id_ = client_manager_->create_client_id();
 }
@@ -152,15 +153,19 @@ void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationStat
                         this->send_query_sync(td_api::make_object<td_api::getChats>(nullptr, 100), 6);
                         std::string start_text = "☔ تم بدء تشغيل الحساب المساعد " + std::to_string(index_) +
                                                  " بنجاح بهوية: " + this->name + " (@" + this->username + ")";
-                        this->send_message(config::LOGGER_ID, start_text);
-                        this->send_message(config::OWNER_ID, start_text);
-                        app.send_message(
-                            config::OWNER_ID,
-                            "✅ <b>تم تشغيل الحساب المساعد " + std::to_string(index_) + " بنجاح!</b>\n"
-                            "• الاسم: " + this->name + "\n"
-                            "• اليوزر: @" + this->username + "\n"
-                            "• الآيدي: <code>" + std::to_string(this->id) + "</code>"
-                        );
+                        if (config::LOGGER_ID != 0) {
+                            this->send_message(config::LOGGER_ID, start_text);
+                        }
+                        if (config::OWNER_ID != 0) {
+                            this->send_message(config::OWNER_ID, start_text);
+                            app.send_message(
+                                config::OWNER_ID,
+                                "✅ <b>تم تشغيل الحساب المساعد " + std::to_string(index_) + " بنجاح!</b>\n"
+                                "• الاسم: " + this->name + "\n"
+                                "• اليوزر: @" + this->username + "\n"
+                                "• الآيدي: <code>" + std::to_string(this->id) + "</code>"
+                            );
+                        }
                     }
                 }).detach();
             }
