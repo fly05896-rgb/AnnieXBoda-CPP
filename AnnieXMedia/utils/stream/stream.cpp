@@ -1,6 +1,7 @@
 #include "AnnieXMedia/utils/stream/stream.hpp"
 #include "AnnieXMedia/core/bot.hpp"
 #include "AnnieXMedia/core/call.hpp"
+#include "AnnieXMedia/logging.hpp"
 #include "AnnieXMedia/misc.hpp"
 #include "AnnieXMedia/utils/database.hpp"
 #include "AnnieXMedia/utils/inline.hpp"
@@ -28,11 +29,7 @@ void start_stream(
 
     std::string file_path = details.file_path;
     if (file_path.empty()) {
-        if (streamtype == "live" || streamtype == "index") {
-            file_path = platforms::YouTube.get_direct_link(details.link, !video);
-        } else {
-            file_path = platforms::YouTube.download(details.link, video, false);
-        }
+        file_path = platforms::YouTube.get_direct_link(details.link, !video);
     }
 
     bool active = database::is_active_chat(chat_id);
@@ -66,7 +63,6 @@ void start_stream(
         return;
     }
 
-    // Join voice/video call via Native C++ NTgCalls
     core::StreamController.join_call(chat_id, original_chat_id, file_path, video, details.thumb);
 
     put_queue(
@@ -82,13 +78,16 @@ void start_stream(
         forceplay
     );
 
-    std::string img = thumbnails::get_thumb(details.vidid);
+    std::string img = !details.thumb.empty() ? details.thumb : thumbnails::get_thumb(details.vidid);
+    if (!details.vidid.empty() && details.vidid.size() == 11) {
+        img = thumbnails::get_thumb(details.vidid);
+    }
     auto buttons = inline_markups::stream_markup(lang, chat_id);
     std::string caption = strings::format_str(
         strings::tr(lang, "stream_1"),
         {
             "https://t.me/" + core::app.username + "?start=info_" + details.vidid,
-            details.title.substr(0, 23),
+            details.title.substr(0, 28),
             details.duration_min,
             user_name
         }
