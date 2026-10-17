@@ -9,71 +9,20 @@ JOBS=$(nproc 2>/dev/null || echo 4)
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-# تثبيت مكتبة pymongo اختيارياً لحفظ جلسة TDLib في MongoDB تلقائياً
-(apt-get update && apt-get install -y --no-install-recommends python3-pymongo python3-dnspython) >/dev/null 2>&1 || true
+# ------------------------------------------------------------------
+# 0. تثبيت محرك NTgCalls الحقيقي وأحدث نسخة من yt-dlp وحذف الكوكيز القديمة
+# ------------------------------------------------------------------
+echo "📦 [0/4] Installing Real NTgCalls WebRTC Engine & updating yt-dlp (Cookie-Free Mode)..."
+rm -f AnnieXMedia/assets/cookies.txt
 
-# إنشاء أداة مزامنة وحفظ جلسة المساعد في MongoDB حتى لا يطلب كود تفعيل عند إعادة التشغيل أو الـ Deploy
-cat << 'PYEOF' > /usr/local/bin/td_session_sync.py
-#!/usr/bin/env python3
-import os, sys, tarfile, io, time
-
-def get_col():
-    uri = os.environ.get("MONGO_DB_URI", "").strip().strip('"').strip("'")
-    if not uri:
-        return None
-    try:
-        import pymongo
-        client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=5000)
-        return client["AnnieMusicBot"]["tdlib_sessions"]
-    except Exception:
-        return None
-
-def backup():
-    col = get_col()
-    if col is None or not os.path.isdir("td_db"):
-        return
-    try:
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            for root, dirs, files in os.walk("td_db"):
-                for f in files:
-                    if f.endswith(".binlog") or f.endswith(".sqlite") or "td.binlog" in f:
-                        full = os.path.join(root, f)
-                        tar.add(full)
-        data = buf.getvalue()
-        if len(data) > 64:
-            col.update_one(
-                {"_id": "td_db_archive"},
-                {"$set": {"data": data, "updated_at": time.time()}},
-                upsert=True
-            )
-            print("✅ [TDLib Session Sync] Backed up td_db session to MongoDB.")
-    except Exception as e:
-        print(f"⚠️ [TDLib Session Sync] Backup warning: {e}")
-
-def restore():
-    col = get_col()
-    if col is None:
-        return
-    try:
-        doc = col.find_one({"_id": "td_db_archive"})
-        if not doc or "data" not in doc:
-            return
-        buf = io.BytesIO(doc["data"])
-        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
-            tar.extractall(".")
-        print("✅ [TDLib Session Sync] Restored td_db session from MongoDB.")
-    except Exception as e:
-        print(f"⚠️ [TDLib Session Sync] Restore warning: {e}")
-
-if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd == "backup":
-        backup()
-    elif cmd == "restore":
-        restore()
-PYEOF
-chmod +x /usr/local/bin/td_session_sync.py || true
+if ! command -v pip3 >/dev/null 2>&1; then
+    apt-get update && apt-get install -y --no-install-recommends python3-pip && rm -rf /var/lib/apt/lists/* || true
+fi
+if command -v pip3 >/dev/null 2>&1; then
+    pip3 install --break-system-packages --upgrade ntgcalls yt-dlp pymongo dnspython 2>/dev/null || \
+    pip3 install --upgrade ntgcalls yt-dlp pymongo dnspython || true
+fi
+curl -4 -sL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp || true
 
 # ------------------------------------------------------------------
 # 1. إصلاح ملفات CMakeLists.txt الخاصة بـ TDLib وبناء المكتبة
@@ -94,7 +43,7 @@ if [ -f "third_party/td/tde2e/CMakeLists.txt" ]; then
 fi
 
 if [ ! -f "/usr/local/lib/libtdclient.a" ] && [ -d "third_party/td" ]; then
-    echo "📦 [1/3] Compiling TDLib from third_party/td..."
+    echo "📦 [1/4] Compiling TDLib from third_party/td..."
     rm -rf third_party/td/build
     mkdir -p third_party/td/build
     cd third_party/td/build
@@ -106,14 +55,223 @@ if [ ! -f "/usr/local/lib/libtdclient.a" ] && [ -d "third_party/td" ]; then
     cmake --build . --target install -j"$JOBS"
     cd "$ROOT_DIR"
 else
-    echo "✅ [1/3] TDLib ready."
+    echo "✅ [1/4] TDLib ready."
 fi
 
 # ------------------------------------------------------------------
-# 2. تجهيز وبناء مكتبة C++ NTgCalls الأصلية (libntgcalls-native.a)
+# 2. بناء محرك وجسر C++ NTgCalls الحقيقي (Real WebRTC Audio/Video Engine)
 # ------------------------------------------------------------------
-echo "📦 [2/3] Building Native C++20 NTgCalls static libraries..."
+echo "📦 [2/4] Building Native C++20 NTgCalls WebRTC Bridge..."
 mkdir -p deps/ntgcalls/include/ntgcalls/media deps/ntgcalls/src deps/ntgcalls/lib
+
+cat << 'EOF' > /usr/local/bin/ntgcalls_daemon.py
+#!/usr/bin/env python3
+import json
+import os
+import shutil
+import socket
+import sys
+import threading
+import traceback
+
+try:
+    from ntgcalls import NTgCalls, MediaDescription, AudioDescription, VideoDescription, MediaSource, StreamMode, StreamType, StreamDevice
+except Exception as e:
+    print(f"[NTgCalls-Engine-ERROR] Failed to load native ntgcalls library: {e}", flush=True)
+    sys.exit(1)
+
+SOCK_PATH = "/tmp/ntgcalls_engine.sock"
+if os.path.exists(SOCK_PATH):
+    try:
+        os.remove(SOCK_PATH)
+    except Exception:
+        pass
+
+clients = {}
+clients_lock = threading.Lock()
+event_subscribers = []
+sub_lock = threading.Lock()
+
+FFMPEG_BIN = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+
+def broadcast_event(evt):
+    data = (json.dumps(evt) + "\n").encode("utf-8")
+    with sub_lock:
+        dead = []
+        for s in event_subscribers:
+            try:
+                s.sendall(data)
+            except Exception:
+                dead.append(s)
+        for d in dead:
+            event_subscribers.remove(d)
+
+def get_client(idx):
+    with clients_lock:
+        if idx not in clients:
+            c = NTgCalls()
+            def on_eof(chat_id, stream_type, device):
+                t_val = 0 if stream_type == StreamType.AUDIO else 1
+                d_val = 0 if device == StreamDevice.MICROPHONE else (2 if device == StreamDevice.CAMERA else 1)
+                print(f"[NTgCalls-Engine] Stream EOF on client #{idx} for chat_id={chat_id}", flush=True)
+                broadcast_event({"event": "eof", "client": idx, "chat_id": int(chat_id), "type": t_val, "device": d_val})
+            try:
+                c.on_stream_end(on_eof)
+            except Exception as e:
+                print(f"[NTgCalls-Engine-WARN] on_stream_end hook warning: {e}", flush=True)
+            clients[idx] = c
+            print(f"[NTgCalls-Engine] Initialized real WebRTC NTgCalls instance #{idx}", flush=True)
+        return clients[idx]
+
+def build_media_desc(media_json):
+    mic = None
+    cam = None
+    if media_json and "audio" in media_json and media_json["audio"]:
+        a = media_json["audio"]
+        inp = a.get("input", "").strip()
+        sr = int(a.get("sample_rate", 48000))
+        ch = int(a.get("channel_count", 2))
+        if inp.startswith("ffmpeg ") or inp.startswith("/usr/bin/ffmpeg"):
+            cmd = inp
+        else:
+            is_url = inp.startswith("http://") or inp.startswith("https://")
+            recon = "-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2 " if is_url else ""
+            cmd = f'{FFMPEG_BIN} -nostdin -hide_banner -loglevel warning {recon}-i "{inp}" -f s16le -ac {ch} -ar {sr} -vn pipe:1'
+        print(f"[NTgCalls-Engine] Audio FFmpeg pipeline: {cmd}", flush=True)
+        mic = AudioDescription(
+            media_source=MediaSource.SHELL,
+            input=cmd,
+            sample_rate=sr,
+            channel_count=ch,
+            keep_open=True
+        )
+    if media_json and "video" in media_json and media_json["video"]:
+        v = media_json["video"]
+        inp = v.get("input", "").strip()
+        w = int(v.get("width", 1280))
+        h = int(v.get("height", 720))
+        fps = int(v.get("fps", 30))
+        if inp.startswith("ffmpeg ") or inp.startswith("/usr/bin/ffmpeg"):
+            cmd = inp
+        else:
+            is_url = inp.startswith("http://") or inp.startswith("https://")
+            recon = "-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2 " if is_url else ""
+            cmd = f'{FFMPEG_BIN} -nostdin -hide_banner -loglevel warning {recon}-i "{inp}" -f rawvideo -r {fps} -pix_fmt yuv420p -vf scale={w}:{h} -an pipe:1'
+        print(f"[NTgCalls-Engine] Video FFmpeg pipeline: {cmd}", flush=True)
+        cam = VideoDescription(
+            media_source=MediaSource.SHELL,
+            input=cmd,
+            width=w,
+            height=h,
+            fps=fps,
+            keep_open=True
+        )
+    return MediaDescription(microphone=mic, camera=cam)
+
+def handle_conn(conn):
+    f = conn.makefile("r", encoding="utf-8")
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            cmd = req.get("cmd", "")
+            if cmd == "subscribe":
+                with sub_lock:
+                    event_subscribers.append(conn)
+                return
+            idx = int(req.get("client", 0))
+            c = get_client(idx)
+            chat_id = int(req.get("chat_id", 0))
+
+            if cmd == "create_call":
+                media_desc = build_media_desc(req.get("media", {}))
+                try:
+                    params = c.create_call(chat_id)
+                    if media_desc.microphone or media_desc.camera:
+                        c.set_stream_sources(chat_id, StreamMode.CAPTURE, media_desc)
+                except TypeError:
+                    params = c.create_call(chat_id, media_desc)
+                print(f"[NTgCalls-Engine] create_call({chat_id}) generated WebRTC payload ({len(params)} bytes)", flush=True)
+                resp = {"ok": True, "result": params}
+            elif cmd == "set_stream_sources":
+                media_desc = build_media_desc(req.get("media", {}))
+                try:
+                    c.set_stream_sources(chat_id, StreamMode.CAPTURE, media_desc)
+                except AttributeError:
+                    c.change_stream(chat_id, media_desc)
+                print(f"[NTgCalls-Engine] set_stream_sources({chat_id}) succeeded", flush=True)
+                resp = {"ok": True}
+            elif cmd == "connect":
+                params = req.get("params", "")
+                is_pres = bool(req.get("is_presentation", False))
+                try:
+                    c.connect(chat_id, params, is_pres)
+                except TypeError:
+                    c.connect(chat_id, params)
+                print(f"[NTgCalls-Engine] connect({chat_id}) WebRTC DTLS-SRTP connected! Audio is streaming now.", flush=True)
+                resp = {"ok": True}
+            elif cmd == "pause":
+                res = bool(c.pause(chat_id))
+                resp = {"ok": True, "result": res}
+            elif cmd == "resume":
+                res = bool(c.resume(chat_id))
+                resp = {"ok": True, "result": res}
+            elif cmd == "mute":
+                res = bool(c.mute(chat_id))
+                resp = {"ok": True, "result": res}
+            elif cmd == "unmute":
+                res = bool(c.unmute(chat_id))
+                resp = {"ok": True, "result": res}
+            elif cmd == "stop":
+                c.stop(chat_id)
+                print(f"[NTgCalls-Engine] stop({chat_id}) stopped call.", flush=True)
+                resp = {"ok": True}
+            elif cmd == "time":
+                try:
+                    t = int(c.time(chat_id, StreamMode.CAPTURE))
+                except TypeError:
+                    t = int(c.time(chat_id))
+                resp = {"ok": True, "result": t}
+            elif cmd == "cpu_usage":
+                resp = {"ok": True, "result": float(c.cpu_usage())}
+            elif cmd == "calls":
+                raw_calls = c.calls()
+                out = {}
+                for k in raw_calls:
+                    out[str(k)] = 0
+                resp = {"ok": True, "result": out}
+            else:
+                resp = {"ok": False, "error": f"Unknown command: {cmd}"}
+        except Exception as e:
+            err_msg = f"{type(e).__name__}: {e}"
+            print(f"[NTgCalls-Engine-ERROR] Command '{req.get('cmd')}' failed for chat {req.get('chat_id')}: {err_msg}\n{traceback.format_exc()}", flush=True)
+            resp = {"ok": False, "error": err_msg}
+
+        try:
+            conn.sendall((json.dumps(resp) + "\n").encode("utf-8"))
+        except Exception:
+            break
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+def main():
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK_PATH)
+    os.chmod(SOCK_PATH, 0o666)
+    srv.listen(64)
+    print(f"[NTgCalls-Engine] Real C++ WebRTC NTgCalls Daemon listening on {SOCK_PATH}", flush=True)
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle_conn, args=(conn,), daemon=True).start()
+
+if __name__ == "__main__":
+    main()
+EOF
+chmod +x /usr/local/bin/ntgcalls_daemon.py
 
 cat << 'EOF' > deps/ntgcalls/include/ntgcalls/media/media_description.hpp
 #pragma once
@@ -127,7 +285,7 @@ class BaseMediaDescription {
 public:
     enum class MediaSource {
         Unknown = 0,
-        File = 0,
+        File = 1 << 0,
         Shell = 1 << 1,
         FFmpeg = 1 << 2,
         Device = 1 << 3,
@@ -149,7 +307,7 @@ public:
     uint32_t sample_rate;
     uint8_t channel_count;
 
-    AudioDescription(const MediaSource src, const uint32_t sr, const uint8_t ch, const std::string& in, const bool keep = false)
+    AudioDescription(const MediaSource src, const uint32_t sr, const uint8_t ch, const std::string& in, const bool keep = true)
         : BaseMediaDescription(in, src, keep), sample_rate(sr), channel_count(ch) {}
 };
 
@@ -158,7 +316,7 @@ public:
     int16_t width, height;
     uint8_t fps;
 
-    VideoDescription(const MediaSource src, const int16_t w, const int16_t h, const uint8_t f, const std::string& in, const bool keep = false)
+    VideoDescription(const MediaSource src, const int16_t w, const int16_t h, const uint8_t f, const std::string& in, const bool keep = true)
         : BaseMediaDescription(in, src, keep), width(w), height(h), fps(f) {}
 };
 
@@ -239,7 +397,9 @@ struct ConnectionInfo {
 };
 
 class NTgCalls {
+    int instance_id_;
     mutable std::mutex mtx_;
+    std::unordered_map<int64_t, media::MediaDescription> pending_media_;
     std::unordered_map<int64_t, media::StreamManager::CallInfo> active_calls_;
     std::function<void(int64_t, media::StreamManager::Type, media::StreamManager::Device)> on_eof_cb_;
     std::function<void(int64_t, ConnectionInfo)> on_conn_cb_;
@@ -270,77 +430,295 @@ EOF
 
 cat << 'EOF' > deps/ntgcalls/src/ntgcalls_bridge.cpp
 #include <ntgcalls/ntgcalls.hpp>
-#include <random>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <sstream>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
+#include <unistd.h>
 
 namespace ntgcalls {
 
-NTgCalls::NTgCalls() = default;
-NTgCalls::~NTgCalls() = default;
+static std::atomic<int> g_next_instance_id{1};
+static std::once_flag g_daemon_once;
+static std::mutex g_instances_mtx;
+static std::unordered_map<int, std::function<void(int64_t, media::StreamManager::Type, media::StreamManager::Device)>> g_eof_callbacks;
+
+static std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '\"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(static_cast<char>(c)); break;
+        }
+    }
+    return out;
+}
+
+static std::string json_unescape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char n = s[++i];
+            if (n == '\"') out.push_back('\"');
+            else if (n == '\\') out.push_back('\\');
+            else if (n == '/') out.push_back('/');
+            else if (n == 'n') out.push_back('\n');
+            else if (n == 'r') out.push_back('\r');
+            else if (n == 't') out.push_back('\t');
+            else out.push_back(n);
+        } else {
+            out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+static std::string extract_json_str(const std::string& json, const std::string& key) {
+    std::string pat = "\"" + key + "\":";
+    auto pos = json.find(pat);
+    if (pos == std::string::npos) return "";
+    pos += pat.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    if (pos >= json.size() || json[pos] != '\"') return "";
+    ++pos;
+    std::string raw;
+    while (pos < json.size()) {
+        if (json[pos] == '\"' && (raw.empty() || raw.back() != '\\')) break;
+        raw.push_back(json[pos++]);
+    }
+    return json_unescape(raw);
+}
+
+static int64_t extract_json_int(const std::string& json, const std::string& key, int64_t def = 0) {
+    std::string pat = "\"" + key + "\":";
+    auto pos = json.find(pat);
+    if (pos == std::string::npos) return def;
+    pos += pat.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+    try {
+        return std::stoll(json.substr(pos));
+    } catch (...) {
+        return def;
+    }
+}
+
+static void ensure_daemon_started() {
+    std::call_once(g_daemon_once, []() {
+        std::system("pkill -f ntgcalls_daemon.py 2>/dev/null || true");
+        std::system("python3 /usr/local/bin/ntgcalls_daemon.py &");
+        for (int i = 0; i < 50; ++i) {
+            if (::access("/tmp/ntgcalls_engine.sock", F_OK) == 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::thread([]() {
+            while (true) {
+                int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+                if (fd >= 0) {
+                    sockaddr_un addr{};
+                    addr.sun_family = AF_UNIX;
+                    std::strncpy(addr.sun_path, "/tmp/ntgcalls_engine.sock", sizeof(addr.sun_path) - 1);
+                    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+                        const char* sub = "{\"cmd\":\"subscribe\"}\n";
+                        (void)::write(fd, sub, std::strlen(sub));
+                        std::string buf;
+                        char tmp[1024];
+                        ssize_t n;
+                        while ((n = ::read(fd, tmp, sizeof(tmp))) > 0) {
+                            buf.append(tmp, static_cast<size_t>(n));
+                            size_t nl;
+                            while ((nl = buf.find('\n')) != std::string::npos) {
+                                std::string line = buf.substr(0, nl);
+                                buf.erase(0, nl + 1);
+                                if (line.find("\"event\": \"eof\"") != std::string::npos || line.find("\"event\":\"eof\"") != std::string::npos) {
+                                    int cid = static_cast<int>(extract_json_int(line, "client", 0));
+                                    int64_t chat_id = extract_json_int(line, "chat_id", 0);
+                                    std::function<void(int64_t, media::StreamManager::Type, media::StreamManager::Device)> cb;
+                                    {
+                                        std::lock_guard<std::mutex> lk(g_instances_mtx);
+                                        if (g_eof_callbacks.count(cid)) cb = g_eof_callbacks[cid];
+                                    }
+                                    if (cb && chat_id != 0) {
+                                        std::thread([cb, chat_id]() {
+                                            cb(chat_id, media::StreamManager::Type::Audio, media::StreamManager::Device::Microphone);
+                                        }).detach();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ::close(fd);
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            }
+        }).detach();
+    });
+}
+
+static std::string send_daemon_rpc(const std::string& payload) {
+    ensure_daemon_started();
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) throw NTgCallsException("Failed to create AF_UNIX socket for NTgCalls daemon");
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, "/tmp/ntgcalls_engine.sock", sizeof(addr.sun_path) - 1);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        throw NTgCallsException("Failed to connect to /tmp/ntgcalls_engine.sock (is ntgcalls_daemon.py running?)");
+    }
+    std::string msg = payload + "\n";
+    (void)::write(fd, msg.data(), msg.size());
+    std::string resp;
+    char buf[4096];
+    ssize_t n;
+    while ((n = ::read(fd, buf, sizeof(buf))) > 0) {
+        resp.append(buf, static_cast<size_t>(n));
+        if (resp.find('\n') != std::string::npos) break;
+    }
+    ::close(fd);
+    if (resp.find("\"ok\": false") != std::string::npos || resp.find("\"ok\":false") != std::string::npos) {
+        std::string err = extract_json_str(resp, "error");
+        throw NTgCallsException(err.empty() ? ("NTgCalls daemon error: " + resp) : err);
+    }
+    return resp;
+}
+
+static std::string serialize_media(const media::MediaDescription& md) {
+    std::ostringstream oss;
+    oss << "{";
+    bool first = true;
+    if (md.microphone.has_value()) {
+        oss << "\"audio\":{\"input\":\"" << json_escape(md.microphone->input) << "\","
+            << "\"sample_rate\":" << md.microphone->sample_rate << ","
+            << "\"channel_count\":" << static_cast<int>(md.microphone->channel_count) << "}";
+        first = false;
+    }
+    if (md.camera.has_value()) {
+        if (!first) oss << ",";
+        oss << "\"video\":{\"input\":\"" << json_escape(md.camera->input) << "\","
+            << "\"width\":" << md.camera->width << ","
+            << "\"height\":" << md.camera->height << ","
+            << "\"fps\":" << static_cast<int>(md.camera->fps) << "}";
+    }
+    oss << "}";
+    return oss.str();
+}
+
+NTgCalls::NTgCalls() : instance_id_(g_next_instance_id.fetch_add(1)) {
+    ensure_daemon_started();
+}
+
+NTgCalls::~NTgCalls() {
+    std::lock_guard<std::mutex> lk(g_instances_mtx);
+    g_eof_callbacks.erase(instance_id_);
+}
 
 std::string NTgCalls::create_call(int64_t chat_id) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    active_calls_[chat_id] = {
-        media::StreamManager::Status::Active,
-        media::StreamManager::Status::Active
-    };
-    std::mt19937 rng(std::random_device{}());
-    uint32_t ssrc = (rng() & 0x7fffffffU) | 1U;
-    std::ostringstream oss;
-    oss << "{\"ufrag\":\"annie" << (ssrc & 0xffff) << "\","
-        << "\"pwd\":\"anniexbodapwd" << ssrc << "\","
-        << "\"fingerprints\":[{\"hash\":\"sha-256\",\"setup\":\"passive\","
-        << "\"fingerprint\":\"00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\"}],"
-        << "\"ssrc\":" << static_cast<int32_t>(ssrc) << ","
-        << "\"ssrc-groups\":[]}";
-    return oss.str();
+    media::MediaDescription md;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (pending_media_.count(chat_id)) {
+            md = pending_media_[chat_id];
+        }
+        active_calls_[chat_id] = {media::StreamManager::Status::Active, media::StreamManager::Status::Active};
+    }
+    std::ostringstream req;
+    req << "{\"cmd\":\"create_call\",\"client\":" << instance_id_
+        << ",\"chat_id\":" << chat_id
+        << ",\"media\":" << serialize_media(md) << "}";
+    std::string resp = send_daemon_rpc(req.str());
+    return extract_json_str(resp, "result");
 }
 
 void NTgCalls::set_stream_sources(int64_t chat_id, media::StreamManager::Mode mode, const media::MediaDescription& media) {
     (void)mode;
-    (void)media;
-    std::lock_guard<std::mutex> lock(mtx_);
-    active_calls_[chat_id].capture = media::StreamManager::Status::Active;
+    bool already_active = false;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        pending_media_[chat_id] = media;
+        already_active = (active_calls_.count(chat_id) > 0);
+    }
+    if (already_active) {
+        std::ostringstream req;
+        req << "{\"cmd\":\"set_stream_sources\",\"client\":" << instance_id_
+            << ",\"chat_id\":" << chat_id
+            << ",\"media\":" << serialize_media(media) << "}";
+        send_daemon_rpc(req.str());
+    }
 }
 
 void NTgCalls::connect(int64_t chat_id, const std::string& params, bool is_presentation) {
-    (void)params;
-    (void)is_presentation;
-    std::lock_guard<std::mutex> lock(mtx_);
-    active_calls_[chat_id].capture = media::StreamManager::Status::Active;
+    std::ostringstream req;
+    req << "{\"cmd\":\"connect\",\"client\":" << instance_id_
+        << ",\"chat_id\":" << chat_id
+        << ",\"params\":\"" << json_escape(params) << "\","
+        << "\"is_presentation\":" << (is_presentation ? "true" : "false") << "}";
+    send_daemon_rpc(req.str());
 }
 
 bool NTgCalls::pause(int64_t chat_id) {
+    std::ostringstream req;
+    req << "{\"cmd\":\"pause\",\"client\":" << instance_id_ << ",\"chat_id\":" << chat_id << "}";
+    send_daemon_rpc(req.str());
     std::lock_guard<std::mutex> lock(mtx_);
-    if (!active_calls_.count(chat_id)) return false;
-    active_calls_[chat_id].capture = media::StreamManager::Status::Paused;
+    if (active_calls_.count(chat_id)) active_calls_[chat_id].capture = media::StreamManager::Status::Paused;
     return true;
 }
 
 bool NTgCalls::resume(int64_t chat_id) {
+    std::ostringstream req;
+    req << "{\"cmd\":\"resume\",\"client\":" << instance_id_ << ",\"chat_id\":" << chat_id << "}";
+    send_daemon_rpc(req.str());
     std::lock_guard<std::mutex> lock(mtx_);
-    if (!active_calls_.count(chat_id)) return false;
-    active_calls_[chat_id].capture = media::StreamManager::Status::Active;
+    if (active_calls_.count(chat_id)) active_calls_[chat_id].capture = media::StreamManager::Status::Active;
     return true;
 }
 
 bool NTgCalls::mute(int64_t chat_id) {
-    return pause(chat_id);
+    std::ostringstream req;
+    req << "{\"cmd\":\"mute\",\"client\":" << instance_id_ << ",\"chat_id\":" << chat_id << "}";
+    send_daemon_rpc(req.str());
+    return true;
 }
 
 bool NTgCalls::unmute(int64_t chat_id) {
-    return resume(chat_id);
+    std::ostringstream req;
+    req << "{\"cmd\":\"unmute\",\"client\":" << instance_id_ << ",\"chat_id\":" << chat_id << "}";
+    send_daemon_rpc(req.str());
+    return true;
 }
 
 void NTgCalls::stop(int64_t chat_id) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    active_calls_.erase(chat_id);
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        active_calls_.erase(chat_id);
+        pending_media_.erase(chat_id);
+    }
+    std::ostringstream req;
+    req << "{\"cmd\":\"stop\",\"client\":" << instance_id_ << ",\"chat_id\":" << chat_id << "}";
+    try { send_daemon_rpc(req.str()); } catch (...) {}
 }
 
 uint64_t NTgCalls::time(int64_t chat_id, media::StreamManager::Mode mode) {
-    (void)chat_id;
     (void)mode;
-    return 0;
+    std::ostringstream req;
+    req << "{\"cmd\":\"time\",\"client\":" << instance_id_ << ",\"chat_id\":" << chat_id << "}";
+    try {
+        std::string resp = send_daemon_rpc(req.str());
+        return static_cast<uint64_t>(extract_json_int(resp, "result", 0));
+    } catch (...) {
+        return 0;
+    }
 }
 
 double NTgCalls::cpu_usage() const {
@@ -357,8 +735,12 @@ std::map<int64_t, media::StreamManager::CallInfo> NTgCalls::calls() {
 }
 
 void NTgCalls::on_stream_end(const std::function<void(int64_t, media::StreamManager::Type, media::StreamManager::Device)>& callback) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    on_eof_cb_ = callback;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        on_eof_cb_ = callback;
+    }
+    std::lock_guard<std::mutex> lk(g_instances_mtx);
+    g_eof_callbacks[instance_id_] = callback;
 }
 
 void NTgCalls::on_connection_change(const std::function<void(int64_t, ConnectionInfo)>& callback) {
@@ -374,453 +756,832 @@ ar rcs deps/ntgcalls/lib/libntgcalls-native.a deps/ntgcalls/src/ntgcalls_bridge.
 ar rcs deps/ntgcalls/lib/libwrtc.a deps/ntgcalls/src/ntgcalls_bridge.o
 cp deps/ntgcalls/lib/libntgcalls-native.a /usr/local/lib/
 cp deps/ntgcalls/lib/libwrtc.a /usr/local/lib/
-echo "✅ [2/3] Native C++ NTgCalls ready."
+echo "✅ [2/4] Native C++ NTgCalls ready."
 
 # ------------------------------------------------------------------
-# 3. تحديث config.cpp
+# 3. تحديث ملفات الكور واليوتيوب (بدون كوكيز نهائياً عبر VISIONOS IPv4)
 # ------------------------------------------------------------------
-cat << 'EOF' > config.cpp
+echo "🔧 [3/4] Updating Youtube.cpp (Cookie-Free VISIONOS + IPv4), cookie_handler.cpp, bot.cpp, userbot.cpp..."
+
+cat << 'EOF' > AnnieXMedia/utils/cookie_handler.cpp
+#include "AnnieXMedia/utils/cookie_handler.hpp"
+#include "AnnieXMedia/logging.hpp"
+#include <filesystem>
+
+namespace AnnieXMedia::utils {
+
+std::string resolve_raw_cookie_url(const std::string& url) {
+    return url;
+}
+
+void fetch_and_store_cookies() {
+    // حذف أي ملف كوكيز قديم حتى يعمل يوتيوب دائماً بدون كوكيز عبر محرك VISIONOS IPv4 المباشر
+    std::error_code ec;
+    if (std::filesystem::exists("AnnieXMedia/assets/cookies.txt", ec)) {
+        std::filesystem::remove("AnnieXMedia/assets/cookies.txt", ec);
+    }
+    LOGGER("AnnieXMedia.utils.cookie_handler").info("✅ Cookie-Free YouTube Innertube Engine (VISIONOS / IPv4) Active.");
+}
+
+} // namespace AnnieXMedia::utils
+EOF
+
+cat << 'EOF' > AnnieXMedia/platforms/Youtube.cpp
+#include "AnnieXMedia/platforms/Youtube.hpp"
+#include "AnnieXMedia/core/dir.hpp"
+#include "AnnieXMedia/core/git.hpp"
+#include "AnnieXMedia/logging.hpp"
+#include "AnnieXMedia/utils/formatters.hpp"
 #include "config.hpp"
-#include <algorithm>
+
+#include <chrono>
 #include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <regex>
+#include <sstream>
+#include <stdexcept>
+#include <unordered_map>
+#include <vector>
 
-extern char **environ;
+namespace AnnieXMedia::platforms {
 
-namespace config {
+YouTubeAPI YouTube;
 
-static void replace_all(std::string& s, const std::string& from, const std::string& to) {
-    if (from.empty()) return;
-    size_t pos = 0;
-    while ((pos = s.find(from, pos)) != std::string::npos) {
-        s.replace(pos, from.length(), to);
-        pos += to.length();
-    }
+namespace {
+
+constexpr int64_t CACHE_TTL_SEC = 3600;
+
+std::mutex g_yt_cache_mtx;
+std::unordered_map<std::string, std::pair<std::string, int64_t>> g_url_cache;
+std::unordered_map<std::string, std::pair<TrackDetails, int64_t>> g_meta_cache;
+
+int64_t now_epoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
 }
 
-static std::string sanitize_value(std::string val, const std::string& key_name = "") {
-    replace_all(val, "\xEF\xBB\xBF", "");
-    replace_all(val, "\xE2\x80\x8E", "");
-    replace_all(val, "\xE2\x80\x8F", "");
-    replace_all(val, "\xE2\x80\x8B", "");
-    replace_all(val, "\xE2\x80\x8C", "");
-    replace_all(val, "\xE2\x80\x8D", "");
-    replace_all(val, "\xE2\x80\xAA", "");
-    replace_all(val, "\xE2\x80\xAB", "");
-    replace_all(val, "\xE2\x80\xAC", "");
-    replace_all(val, "\xE2\x80\xAD", "");
-    replace_all(val, "\xE2\x80\xAE", "");
-    replace_all(val, "\xE2\x81\xA6", "");
-    replace_all(val, "\xE2\x81\xA7", "");
-    replace_all(val, "\xE2\x81\xA8", "");
-    replace_all(val, "\xE2\x81\xA9", "");
-    replace_all(val, "\xC2\xA0", " ");
-
-    for (int i = 0; i < 10; ++i) {
-        std::string ar_digit = "\xD9" + std::string(1, static_cast<char>(0xA0 + i));
-        std::string fa_digit = "\xDB" + std::string(1, static_cast<char>(0xB0 + i));
-        std::string en_digit(1, static_cast<char>('0' + i));
-        replace_all(val, ar_digit, en_digit);
-        replace_all(val, fa_digit, en_digit);
+std::string shell_quote(const std::string& arg) {
+    std::string out = "'";
+    for (char c : arg) {
+        if (c == '\'') out += "'\\''";
+        else out.push_back(c);
     }
-
-    auto is_trim_char = [](unsigned char c) {
-        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '"' || c == '\'' || c == '`';
-    };
-
-    while (!val.empty() && is_trim_char(static_cast<unsigned char>(val.front()))) val.erase(val.begin());
-    while (!val.empty() && is_trim_char(static_cast<unsigned char>(val.back()))) val.pop_back();
-
-    if (!key_name.empty()) {
-        auto eq_pos = val.find('=');
-        if (eq_pos != std::string::npos) {
-            std::string prefix = val.substr(0, eq_pos);
-            while (!prefix.empty() && is_trim_char(static_cast<unsigned char>(prefix.front()))) prefix.erase(prefix.begin());
-            while (!prefix.empty() && is_trim_char(static_cast<unsigned char>(prefix.back()))) prefix.pop_back();
-            if (prefix == key_name) {
-                val = val.substr(eq_pos + 1);
-                while (!val.empty() && is_trim_char(static_cast<unsigned char>(val.front()))) val.erase(val.begin());
-                while (!val.empty() && is_trim_char(static_cast<unsigned char>(val.back()))) val.pop_back();
-            }
-        }
-    }
-
-    return val;
+    out += "'";
+    return out;
 }
 
-static std::string lookup_raw_env(const char* name) {
-    if (!name || !*name) return "";
-    if (const char* direct = std::getenv(name)) {
-        if (*direct) return std::string(direct);
+bool is_valid_vidid(const std::string& s) {
+    if (s.size() != 11) return false;
+    for (unsigned char c : s) {
+        if (!std::isalnum(c) && c != '-' && c != '_') return false;
     }
-    std::string target(name);
-    std::transform(target.begin(), target.end(), target.begin(), [](unsigned char c) { return std::toupper(c); });
-    if (!environ) return "";
-    for (char **env = environ; *env != nullptr; ++env) {
-        std::string entry(*env);
-        auto eq = entry.find('=');
-        if (eq == std::string::npos) continue;
-        std::string k = sanitize_value(entry.substr(0, eq));
-        std::transform(k.begin(), k.end(), k.begin(), [](unsigned char c) { return std::toupper(c); });
-        if (k == target) {
-            return entry.substr(eq + 1);
+    return true;
+}
+
+std::string extract_vid(const std::string& link, bool is_videoid = false) {
+    if (is_videoid && is_valid_vidid(link)) {
+        return link;
+    }
+    std::string s = link;
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+
+    if (s.size() == 13 && s.ends_with("_v")) {
+        s = s.substr(0, 11);
+    }
+    if (is_valid_vidid(s) && s.rfind("http", 0) != 0 && s.find(' ') == std::string::npos) {
+        return s;
+    }
+    auto vpos = s.find("v=");
+    if (vpos != std::string::npos) {
+        std::string sub = s.substr(vpos + 2);
+        auto amp = sub.find_first_of("&#? ");
+        if (amp != std::string::npos) sub = sub.substr(0, amp);
+        if (is_valid_vidid(sub)) return sub;
+    }
+    for (const char* prefix : {"youtu.be/", "/shorts/", "/live/"}) {
+        auto ppos = s.find(prefix);
+        if (ppos != std::string::npos) {
+            std::string sub = s.substr(ppos + std::char_traits<char>::length(prefix));
+            auto qpos = sub.find_first_of("?&# ");
+            if (qpos != std::string::npos) sub = sub.substr(0, qpos);
+            if (is_valid_vidid(sub)) return sub;
         }
     }
     return "";
 }
 
-void load_dotenv(const std::string& path) {
-    std::ifstream file(path);
-    if (!file.is_open()) return;
-    std::string line;
-    while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        auto pos = line.find('=');
-        if (pos == std::string::npos) continue;
-        std::string key = sanitize_value(line.substr(0, pos));
-        std::string val = sanitize_value(line.substr(pos + 1), key);
-        if (!key.empty() && !val.empty()) {
-            setenv(key.c_str(), val.c_str(), 0);
+std::string sec_to_min_str(int seconds) {
+    if (seconds <= 0) return "0:00";
+    int m = seconds / 60;
+    int s = seconds % 60;
+    int h = m / 60;
+    m %= 60;
+    char buf[32];
+    if (h > 0) {
+        std::snprintf(buf, sizeof(buf), "%d:%02d:%02d", h, m, s);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%d:%02d", m, s);
+    }
+    return buf;
+}
+
+int parse_duration_to_sec(const std::string& dur) {
+    if (dur.empty() || dur == "Live") return 0;
+    std::vector<int> parts;
+    std::stringstream ss(dur);
+    std::string item;
+    while (std::getline(ss, item, ':')) {
+        try {
+            parts.push_back(std::stoi(item));
+        } catch (...) {
+            return 0;
         }
     }
+    int total = 0;
+    int mult = 1;
+    for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+        total += (*it) * mult;
+        mult *= 60;
+    }
+    return total;
 }
 
-std::string getenv_str(const char* name, const std::string& def) {
-    std::string raw = lookup_raw_env(name);
-    std::string cleaned = sanitize_value(raw, name ? name : "");
-    return !cleaned.empty() ? cleaned : def;
-}
+struct JsonVal {
+    enum Type { Null, Bool, Number, String, Array, Object } type = Null;
+    bool b = false;
+    double num = 0.0;
+    std::string str;
+    std::vector<JsonVal> arr;
+    std::map<std::string, JsonVal> obj;
 
-int64_t getenv_int(const char* name, int64_t def) {
-    std::string cleaned = getenv_str(name, "");
-    if (cleaned.empty()) return def;
-    try {
-        return std::stoll(cleaned);
-    } catch (...) {
-        std::string num_only;
-        for (size_t i = 0; i < cleaned.size(); ++i) {
-            char c = cleaned[i];
-            if (c == '-' && num_only.empty() && i + 1 < cleaned.size() && std::isdigit(static_cast<unsigned char>(cleaned[i + 1]))) {
-                num_only.push_back(c);
-            } else if (std::isdigit(static_cast<unsigned char>(c))) {
-                num_only.push_back(c);
-            } else if (!num_only.empty()) {
-                break;
-            }
-        }
-        if (!num_only.empty() && num_only != "-") {
-            try {
-                return std::stoll(num_only);
-            } catch (...) {}
+    const JsonVal& get(const std::string& k) const {
+        static const JsonVal null_v;
+        if (type != Object) return null_v;
+        auto it = obj.find(k);
+        return (it != obj.end()) ? it->second : null_v;
+    }
+    std::string as_str(const std::string& def = "") const {
+        if (type == String) return str;
+        if (type == Number) return std::to_string(static_cast<int64_t>(num));
+        return def;
+    }
+    int64_t as_int(int64_t def = 0) const {
+        if (type == Number) return static_cast<int64_t>(num);
+        if (type == String) {
+            try { return std::stoll(str); } catch (...) {}
         }
         return def;
     }
-}
+    bool as_bool(bool def = false) const {
+        if (type == Bool) return b;
+        return def;
+    }
+};
 
-bool getenv_bool(const char* name, bool def) {
-    std::string val = getenv_str(name, def ? "True" : "False");
-    return (val == "1" || val == "true" || val == "True" || val == "TRUE" || val == "yes" || val == "on");
-}
+class JsonParser {
+    const std::string& s_;
+    size_t pos_ = 0;
 
-int time_to_seconds(const std::string& time_str) {
-    try {
-        std::vector<int> parts;
-        std::stringstream ss(time_str);
-        std::string item;
-        while (std::getline(ss, item, ':')) {
-            parts.push_back(std::stoi(item));
+    void skip_ws() {
+        while (pos_ < s_.size() && (s_[pos_] == ' ' || s_[pos_] == '\n' || s_[pos_] == '\r' || s_[pos_] == '\t')) {
+            ++pos_;
         }
-        int total = 0;
-        int mult = 1;
-        for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
-            total += (*it) * mult;
-            mult *= 60;
-        }
-        return total;
-    } catch (...) {
-        return 0;
     }
+
+    static void append_utf8(std::string& out, uint32_t cp) {
+        if (cp <= 0x7F) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp <= 0x7FF) {
+            out.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp <= 0xFFFF) {
+            out.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+
+    std::string parse_string() {
+        if (pos_ >= s_.size() || s_[pos_] != '"') return "";
+        ++pos_;
+        std::string out;
+        while (pos_ < s_.size()) {
+            char c = s_[pos_++];
+            if (c == '"') return out;
+            if (c == '\\' && pos_ < s_.size()) {
+                char esc = s_[pos_++];
+                switch (esc) {
+                    case '"': out.push_back('"'); break;
+                    case '\\': out.push_back('\\'); break;
+                    case '/': out.push_back('/'); break;
+                    case 'b': out.push_back('\b'); break;
+                    case 'f': out.push_back('\f'); break;
+                    case 'n': out.push_back('\n'); break;
+                    case 'r': out.push_back('\r'); break;
+                    case 't': out.push_back('\t'); break;
+                    case 'u': {
+                        if (pos_ + 4 <= s_.size()) {
+                            uint32_t cp = 0;
+                            try { cp = static_cast<uint32_t>(std::stoul(s_.substr(pos_, 4), nullptr, 16)); } catch (...) {}
+                            pos_ += 4;
+                            if (cp >= 0xD800 && cp <= 0xDBFF && pos_ + 6 <= s_.size() && s_[pos_] == '\\' && s_[pos_ + 1] == 'u') {
+                                uint32_t low = 0;
+                                try { low = static_cast<uint32_t>(std::stoul(s_.substr(pos_ + 2, 4), nullptr, 16)); } catch (...) {}
+                                if (low >= 0xDC00 && low <= 0xDFFF) {
+                                    pos_ += 6;
+                                    cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
+                                }
+                            }
+                            append_utf8(out, cp);
+                        }
+                        break;
+                    }
+                    default: out.push_back(esc); break;
+                }
+            } else {
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+
+public:
+    explicit JsonParser(const std::string& s) : s_(s) {}
+
+    JsonVal parse_value() {
+        skip_ws();
+        if (pos_ >= s_.size()) return {};
+        char c = s_[pos_];
+        if (c == '"') {
+            JsonVal v;
+            v.type = JsonVal::String;
+            v.str = parse_string();
+            return v;
+        }
+        if (c == '{') {
+            ++pos_;
+            JsonVal v;
+            v.type = JsonVal::Object;
+            skip_ws();
+            if (pos_ < s_.size() && s_[pos_] == '}') { ++pos_; return v; }
+            while (pos_ < s_.size()) {
+                skip_ws();
+                std::string k = parse_string();
+                skip_ws();
+                if (pos_ < s_.size() && s_[pos_] == ':') ++pos_;
+                v.obj[std::move(k)] = parse_value();
+                skip_ws();
+                if (pos_ < s_.size() && s_[pos_] == ',') { ++pos_; continue; }
+                if (pos_ < s_.size() && s_[pos_] == '}') { ++pos_; break; }
+                break;
+            }
+            return v;
+        }
+        if (c == '[') {
+            ++pos_;
+            JsonVal v;
+            v.type = JsonVal::Array;
+            skip_ws();
+            if (pos_ < s_.size() && s_[pos_] == ']') { ++pos_; return v; }
+            while (pos_ < s_.size()) {
+                v.arr.push_back(parse_value());
+                skip_ws();
+                if (pos_ < s_.size() && s_[pos_] == ',') { ++pos_; continue; }
+                if (pos_ < s_.size() && s_[pos_] == ']') { ++pos_; break; }
+                break;
+            }
+            return v;
+        }
+        if (s_.compare(pos_, 4, "true") == 0) {
+            pos_ += 4;
+            JsonVal v; v.type = JsonVal::Bool; v.b = true; return v;
+        }
+        if (s_.compare(pos_, 5, "false") == 0) {
+            pos_ += 5;
+            JsonVal v; v.type = JsonVal::Bool; v.b = false; return v;
+        }
+        if (s_.compare(pos_, 4, "null") == 0) {
+            pos_ += 4;
+            return {};
+        }
+        size_t start = pos_;
+        while (pos_ < s_.size() && (std::isdigit(static_cast<unsigned char>(s_[pos_])) ||
+               s_[pos_] == '-' || s_[pos_] == '+' || s_[pos_] == '.' || s_[pos_] == 'e' || s_[pos_] == 'E')) {
+            ++pos_;
+        }
+        if (pos_ > start) {
+            JsonVal v;
+            v.type = JsonVal::Number;
+            try { v.num = std::stod(s_.substr(start, pos_ - start)); } catch (...) { v.num = 0.0; }
+            return v;
+        }
+        ++pos_;
+        return {};
+    }
+};
+
+std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out.push_back(static_cast<char>(c)); break;
+        }
+    }
+    return out;
 }
 
-int32_t API_ID = 94575;
-std::string API_HASH = "a3406de8d171bb422bb6ddf3bbd800e2";
-std::string BOT_TOKEN;
-int64_t OWNER_ID = 8313557781LL;
-std::string OWNER_USERNAME = "𝐁ᴏᴅᴀ˼";
-std::string BOT_USERNAME = "Boda";
-std::string BOT_NAME = "˹𝚂ᴏᴜʀᴄᴇ ✘ 𝐁ᴏᴅᴀ˼ ♪";
-std::string ASSUSERNAME = "S_G0C7";
-std::string DOWNLOAD_PATH = "/dev/shm/AnnieDownloads";
-std::string AUTO_DOWNLOADS_CLEAR = "True";
-std::string MONGO_DB_URI;
-int64_t LOGGER_ID = -1004295349964LL;
-int DURATION_LIMIT_MIN = 600;
-int DURATION_LIMIT = 36000;
-int SONG_DOWNLOAD_DURATION = 3600;
-int SONG_DOWNLOAD_DURATION_LIMIT = 5400;
-int64_t TG_AUDIO_FILESIZE_LIMIT = 2147483648LL;
-int64_t TG_VIDEO_FILESIZE_LIMIT = 2147483648LL;
-int PLAYLIST_FETCH_LIMIT = 100;
-int AI_HANDLER_GROUP = 30;
-int SERVER_PLAYLIST_LIMIT = 30;
-std::string COOKIE_URL;
-std::string API_URL = "https://hyperionengine.fly.dev";
-std::string VIDEO_API_URL = "https://hyperionengine.fly.dev";
-std::string API_KEY;
-std::string DEEP_API;
-std::string AI_API_KEY;
-std::string HEROKU_APP_NAME;
-std::string HEROKU_API_KEY;
-std::string UPSTREAM_REPO = "https://t.me/SourceBoda";
-std::string UPSTREAM_BRANCH = "Master";
-std::string GIT_TOKEN;
-std::string SUPPORT_CHANNEL = "https://t.me/SourceBoda";
-std::string SUPPORT_CHAT = "https://t.me/music0587";
-std::string AUTO_LEAVING_ASSISTANT = "False";
-int AUTO_LEAVE_ASSISTANT_TIME = 3600;
-bool AUTO_END = false;
-bool DEBUG_IGNORE_LOG = true;
-std::string SPOTIFY_CLIENT_ID = "22b6125bfe224587b722d6815002db2b";
-std::string SPOTIFY_CLIENT_SECRET = "c9c63c6fbf2f467c8bc68624851e9773";
-std::string STRING1;
-std::string STRING2;
-std::string STRING3;
-std::string STRING4;
-std::string STRING5;
-
-std::vector<std::string> START_VIDS = {
-    "https://files.catbox.moe/b6533n.jpg",
-    "https://files.catbox.moe/wqipfn.jpg",
-    "https://files.catbox.moe/efzuds.jpg",
-};
-
-std::vector<std::string> STICKERS = {
-    "CAACAgQAAyEFAATHCHTJAAIToGlfMcgnOpNnuYnm1hlBTW_pZgZfAAIfFgAC-CS4UbtZNHZyyA3BHgQ",
-    "CAACAgUAAyEFAATHCHTJAAITn2lfMb5VpY0QAom50knojYHju4bTAAILFQAC-vEZVMBmWHCQ-sJuHgQ",
-};
-
-std::string UNIFIED_IMG = "https://files.catbox.moe/ompn1o.jpg";
-std::string START_IMG_URL = UNIFIED_IMG;
-std::string HELP_IMG_URL = UNIFIED_IMG;
-std::string PING_VID_URL = UNIFIED_IMG;
-std::string PLAYLIST_IMG_URL = UNIFIED_IMG;
-std::string STATS_VID_URL = UNIFIED_IMG;
-std::string TELEGRAM_AUDIO_URL = UNIFIED_IMG;
-std::string TELEGRAM_VIDEO_URL = UNIFIED_IMG;
-std::string STREAM_IMG_URL = UNIFIED_IMG;
-std::string SOUNCLOUD_IMG_URL = UNIFIED_IMG;
-std::string YOUTUBE_IMG_URL = UNIFIED_IMG;
-std::string SPOTIFY_ARTIST_IMG_URL = UNIFIED_IMG;
-std::string SPOTIFY_ALBUM_IMG_URL = UNIFIED_IMG;
-std::string SPOTIFY_PLAYLIST_IMG_URL = UNIFIED_IMG;
-
-std::vector<std::string> AYU = {
-    "جـاري الـتـشـغـيـل .. 🤍",
-    "جـاري الـتـحـمـيـل .. 🫶",
-    "لـحـظـة مـن فـضـلـك .. 🤍",
-    "طـلـبـك قـيـد الـتـنـفـيـذ .. ☔",
-    "يـتـم تـشـغـيـل الـتـراك .. 💝"
-};
-
-std::vector<std::string> AYUV = {
-    "صـلـي عـلـي الـنـبـي وتـبـسـم 🤍🌿.\n"
-    "مـرحـبـا انـا بـوت تـشـغـيـل صوتيات متطور ☔\n"
-    "أهـلاً بـك عـزيـزي {0} 🫶\n"
-    "وظـيـفـتـي تـشـغـيـل الـمـيـديـا فـي الـمـكـالـمـات بـجـودة عـالـيـة وبـدون تـقـطـيـع 🤍.\n"
-    "⧉ لـتـشـغـيـل أغـنـيـة اكـتـب « تشغيل + اسم الاغنية »\n"
-    "⧉ لـلـتـحـكـم فـي الـبـوت اضـغـط « الأوامـر » بـالأسـفـل 💝.\n"
-    "ـــــــــــــــــــــــــــــــــــــــــــــــــــــــ\n"
-    "⧉ وقـت الـعـمـل : {2}\n"
-    "⧉ الـرام : {5}\n"
-    "ـــــــــــــــــــــــــــــــــــــــــــــــــــــــ",
-    "صـلـي عـلـي الـنـبـي وتـبـسـم 🤍🌿.\n"
-    "مـرحـبـا انـا بـوت تـشـغـيـل صوتيات متطور ☔\n"
-    "أهـلاً بـكـم فـي {0} 🫶\n"
-    "أنـا {1} .. جـاهـز لـخـدمـتـكـم 🤍.\n"
-    "⧉ أعـمـل بـكـفـاءة عـالـيـة بـدون تـوقـف.\n"
-    "⧉ فـقـط أضـفـنـي لـمـجـمـوعـتـك وارفـعـنـي مـشـرف 💝.\n"
-    "⧉ وقـت الـتـشـغـيـل : {2}"
-};
-
-std::unordered_set<int64_t> BANNED_USERS;
-std::unordered_map<int64_t, std::vector<int64_t>> adminlist;
-std::unordered_map<int64_t, std::unordered_map<std::string, std::string>> confirmer;
-std::unordered_map<std::string, std::string> lyrical;
-std::vector<std::string> autoclean;
-std::mutex runtime_mutex;
-
-void init_config() {
-    load_dotenv(".env");
-    load_dotenv("/app/.env");
-
-    std::string raw_api_id = getenv_str("API_ID", "");
-    std::string raw_api_hash = getenv_str("API_HASH", "");
-    std::string raw_bot_token = getenv_str("BOT_TOKEN", "");
-    std::string raw_owner_id = getenv_str("OWNER_ID", "");
-    std::string raw_logger_id = getenv_str("LOGGER_ID", "");
-    std::string raw_mongo = getenv_str("MONGO_DB_URI", "");
-    std::string raw_session = getenv_str("STRING_SESSION", getenv_str("STRING1", ""));
-
-    std::cout << "==========================================================\n"
-              << "🔍 [فحص قيم السكرتس المقروءة من النظام]\n"
-              << "   • API_ID         = [" << raw_api_id << "] (طول النص=" << raw_api_id.size() << ")\n"
-              << "   • API_HASH       = [" << raw_api_hash << "] (طول النص=" << raw_api_hash.size() << ")\n"
-              << "   • BOT_TOKEN      = [" << raw_bot_token << "] (طول النص=" << raw_bot_token.size() << ")\n"
-              << "   • OWNER_ID       = [" << raw_owner_id << "]\n"
-              << "   • LOGGER_ID      = [" << raw_logger_id << "]\n"
-              << "   • MONGO_DB_URI   = [" << (raw_mongo.empty() ? "فارغ" : (raw_mongo.substr(0, 25) + "...")) << "] (طول النص=" << raw_mongo.size() << ")\n"
-              << "   • STRING_SESSION = [طول النص=" << raw_session.size() << "]\n"
-              << "==========================================================" << std::endl;
-
-    API_ID = static_cast<int32_t>(getenv_int("API_ID", 0));
-    API_HASH = raw_api_hash;
-
-    bool hash_is_digits = !raw_api_hash.empty() && std::all_of(raw_api_hash.begin(), raw_api_hash.end(), [](unsigned char c) { return std::isdigit(c); });
-    if ((API_ID == 0 || raw_api_id.size() >= 20) && hash_is_digits && raw_api_id.size() >= 16) {
-        std::cout << "⚠️ ملاحظة: تم اكتشاف تبديل بين API_ID و API_HASH في الـ Secrets، وتم تصحيحهما تلقائياً!" << std::endl;
-        API_ID = static_cast<int32_t>(std::stoll(raw_api_hash));
-        API_HASH = raw_api_id;
+std::optional<TrackDetails> innertube_player(const std::string& vid, const std::string& base_url) {
+    if (!is_valid_vidid(vid)) return std::nullopt;
+    int64_t now = now_epoch();
+    {
+        std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
+        auto it = g_meta_cache.find(vid);
+        if (it != g_meta_cache.end() && it->second.second > now) {
+            auto a_it = g_url_cache.find(vid + ":a");
+            if (a_it != g_url_cache.end() && a_it->second.second > now) {
+                return it->second.first;
+            }
+        }
     }
 
-    if (API_ID <= 0 || API_HASH.size() < 20) {
-        std::cout << "⚡ تنبيه: قيمة API_ID أو API_HASH في السكرتس غير قياسية، تم التبديل تلقائياً إلى مفاتيح TDLib الرسمية المدمجة (api_id=94575 من td_example.cpp) لتشغيل البوت فوراً بدون توقف!" << std::endl;
-        API_ID = 94575;
-        API_HASH = "a3406de8d171bb422bb6ddf3bbd800e2";
+    std::string payload =
+        "{\"context\":{\"client\":{"
+        "\"clientName\":\"VISIONOS\","
+        "\"clientVersion\":\"1.02\","
+        "\"deviceMake\":\"Apple\","
+        "\"deviceModel\":\"RealityDevice17,1\","
+        "\"osName\":\"visionOS\","
+        "\"osVersion\":\"26.5.23O471\","
+        "\"hl\":\"en\","
+        "\"timeZone\":\"UTC\","
+        "\"utcOffsetMinutes\":0"
+        "}},\"videoId\":\"" + json_escape(vid) + "\","
+        "\"contentCheckOk\":true,\"racyCheckOk\":true}";
+
+    std::string cmd =
+        "curl -4 -sS --max-time 4 --connect-timeout 2 "
+        "-X POST 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false' "
+        "-H 'Content-Type: application/json' "
+        "-H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15' "
+        "-H 'X-YouTube-Client-Name: 101' "
+        "-H 'X-YouTube-Client-Version: 1.02' "
+        "-H 'Origin: https://www.youtube.com' "
+        "--data-raw " + shell_quote(payload) + " 2>/dev/null";
+
+    auto [out, rc] = core::run_shell_command(cmd);
+    if (rc != 0 || out.empty()) return std::nullopt;
+
+    JsonVal root = JsonParser(out).parse_value();
+    const JsonVal& vd = root.get("videoDetails");
+    std::string title = vd.get("title").as_str();
+    if (title.empty()) return std::nullopt;
+
+    std::string v_id = vd.get("videoId").as_str(vid);
+    int secs = static_cast<int>(vd.get("lengthSeconds").as_int(0));
+    bool is_live = vd.get("isLive").as_bool(false) || (vd.get("isLiveContent").as_bool(false) && secs == 0);
+    std::string duration_min = is_live ? "Live" : sec_to_min_str(secs);
+
+    const JsonVal& sd = root.get("streamingData");
+    std::string cached_audio_url;
+    std::string cached_video_url;
+
+    auto scan_formats = [&](const JsonVal& arr_val) {
+        if (arr_val.type != JsonVal::Array) return;
+        for (const auto& fmt : arr_val.arr) {
+            std::string f_url = fmt.get("url").as_str();
+            if (f_url.empty()) continue;
+            std::string itag = fmt.get("itag").as_str();
+            std::string mime = fmt.get("mimeType").as_str();
+            if (itag == "18") {
+                cached_video_url = f_url;
+                if (cached_audio_url.empty()) cached_audio_url = f_url;
+            } else if (mime.find("audio") != std::string::npos) {
+                cached_audio_url = f_url;
+            }
+        }
+    };
+    scan_formats(sd.get("formats"));
+    scan_formats(sd.get("adaptiveFormats"));
+
+    TrackDetails td;
+    td.title = title;
+    td.vidid = v_id;
+    td.link = base_url + v_id;
+    td.duration_sec = secs;
+    td.duration_min = duration_min;
+    td.thumb = "https://i.ytimg.com/vi/" + v_id + "/hqdefault.jpg";
+
+    {
+        std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
+        g_meta_cache[v_id] = {td, now + CACHE_TTL_SEC};
+        if (!cached_video_url.empty()) {
+            g_url_cache[v_id + ":v"] = {cached_video_url, now + CACHE_TTL_SEC};
+        }
+        if (!cached_audio_url.empty()) {
+            g_url_cache[v_id + ":a"] = {cached_audio_url, now + CACHE_TTL_SEC};
+        }
     }
 
-    BOT_TOKEN = raw_bot_token;
-    OWNER_ID = getenv_int("OWNER_ID", 8313557781LL);
-    OWNER_USERNAME = getenv_str("OWNER_USERNAME", "𝐁ᴏᴅᴀ˼");
-    BOT_USERNAME = getenv_str("BOT_USERNAME", "Boda");
-    BOT_NAME = getenv_str("BOT_NAME", "˹𝚂ᴏᴜʀᴄᴇ ✘ 𝐁ᴏᴅᴀ˼ ♪");
-    ASSUSERNAME = getenv_str("ASSUSERNAME", "S_G0C7");
+    return td;
+}
 
-    if (std::filesystem::exists("/dev/shm")) {
-        DOWNLOAD_PATH = "/dev/shm/AnnieDownloads";
+std::vector<TrackDetails> innertube_search(const std::string& query, int limit, const std::string& base_url) {
+    std::vector<TrackDetails> results;
+    if (query.empty()) return results;
+
+    std::string payload =
+        "{\"context\":{\"client\":{"
+        "\"clientName\":\"WEB\","
+        "\"clientVersion\":\"2.20260708.00.00\","
+        "\"hl\":\"ar\","
+        "\"gl\":\"EG\","
+        "\"timeZone\":\"UTC\","
+        "\"utcOffsetMinutes\":0"
+        "}},\"query\":\"" + json_escape(query) + "\","
+        "\"params\":\"EgIQAfABAQ==\"}";
+
+    std::string cmd =
+        "curl -4 -sS --max-time 4 --connect-timeout 2 "
+        "-X POST 'https://www.youtube.com/youtubei/v1/search?prettyPrint=false' "
+        "-H 'Content-Type: application/json' "
+        "-H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' "
+        "-H 'X-YouTube-Client-Name: 1' "
+        "-H 'X-YouTube-Client-Version: 2.20260708.00.00' "
+        "-H 'Origin: https://www.youtube.com' "
+        "--data-raw " + shell_quote(payload) + " 2>/dev/null";
+
+    auto [out, rc] = core::run_shell_command(cmd);
+    if (rc != 0 || out.empty()) return results;
+
+    JsonVal root = JsonParser(out).parse_value();
+    const JsonVal& sections = root.get("contents")
+        .get("twoColumnSearchResultsRenderer")
+        .get("primaryContents")
+        .get("sectionListRenderer")
+        .get("contents");
+
+    if (sections.type != JsonVal::Array) return results;
+
+    int64_t now = now_epoch();
+    for (const auto& sec : sections.arr) {
+        const JsonVal& items = sec.get("itemSectionRenderer").get("contents");
+        if (items.type != JsonVal::Array) continue;
+        for (const auto& item : items.arr) {
+            const JsonVal& vr = item.get("videoRenderer");
+            if (vr.type != JsonVal::Object) continue;
+            std::string v_id = vr.get("videoId").as_str();
+            if (v_id.empty()) continue;
+
+            std::string title;
+            const JsonVal& runs = vr.get("title").get("runs");
+            if (runs.type == JsonVal::Array) {
+                for (const auto& r : runs.arr) {
+                    title += r.get("text").as_str();
+                }
+            }
+            if (title.empty()) title = "Unknown";
+
+            std::string dur_text = vr.get("lengthText").get("simpleText").as_str();
+            if (dur_text.empty()) {
+                dur_text = vr.get("lengthText")
+                    .get("accessibility")
+                    .get("accessibilityData")
+                    .get("label")
+                    .as_str("Live");
+            }
+
+            TrackDetails td;
+            td.title = title;
+            td.vidid = v_id;
+            td.link = base_url + v_id;
+            td.duration_min = dur_text;
+            td.duration_sec = parse_duration_to_sec(dur_text);
+            td.thumb = "https://i.ytimg.com/vi/" + v_id + "/hqdefault.jpg";
+
+            {
+                std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
+                g_meta_cache[v_id] = {td, now + CACHE_TTL_SEC};
+            }
+            results.push_back(std::move(td));
+            if (static_cast<int>(results.size()) >= limit) return results;
+        }
+    }
+    return results;
+}
+
+} // namespace
+
+bool YouTubeAPI::exists(const std::string& link) const {
+    static const std::regex yt_re(
+        R"((https?://)?(www\.|m\.|music\.)?(youtube\.com/(watch\?v=|shorts/|live/|playlist\?list=)|youtu\.be/)([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+|OLAK5uy_[A-Za-z0-9_-]+)([&?][^\s]*)?)"
+    );
+    return std::regex_search(link, yt_re);
+}
+
+TrackDetails YouTubeAPI::track(const std::string& query_or_link, bool is_videoid) {
+    std::string vid = extract_vid(query_or_link, is_videoid);
+
+    if (is_valid_vidid(vid)) {
+        LOGGER("AnnieXMedia.platforms.Youtube").info("⚡ Fast Innertube Player lookup (cookie-free IPv4) for videoId: " + vid);
+        if (auto info = innertube_player(vid, base)) {
+            LOGGER("AnnieXMedia.platforms.Youtube").info(
+                "✅ YouTube track found (Innertube Player): title=[" + info->title + "] id=[" + info->vidid + "] duration=[" + info->duration_min + "]"
+            );
+            return *info;
+        }
+    }
+
+    std::string query = is_valid_vidid(vid) ? vid : query_or_link;
+    while (!query.empty() && std::isspace(static_cast<unsigned char>(query.front()))) query.erase(query.begin());
+    while (!query.empty() && std::isspace(static_cast<unsigned char>(query.back()))) query.pop_back();
+
+    LOGGER("AnnieXMedia.platforms.Youtube").info("🔎 Fast Innertube Search (cookie-free IPv4) for query: " + query);
+    auto results = innertube_search(query, 1, base);
+    if (!results.empty()) {
+        TrackDetails first = results.front();
+        if (is_valid_vidid(first.vidid)) {
+            if (auto full_info = innertube_player(first.vidid, base)) {
+                first = *full_info;
+            }
+        }
+        LOGGER("AnnieXMedia.platforms.Youtube").info(
+            "✅ YouTube track found: title=[" + first.title + "] id=[" + first.vidid + "] duration=[" + first.duration_min + "]"
+        );
+        return first;
+    }
+
+    std::string target = is_valid_vidid(vid) ? (base + vid) : ("ytsearch1:" + query);
+    std::string cmd =
+        "yt-dlp --no-cookies --force-ipv4 --source-address 0.0.0.0 --no-warnings --no-check-certificates --flat-playlist "
+        "--extractor-args \"youtube:player_client=visionos,android;player_skip=webpage,configs,initial_data,js;fetch_pot=never\" "
+        "--print \"%(id)s\t%(title)s\t%(duration)s\t%(webpage_url)s\t%(thumbnail)s\" " +
+        shell_quote(target) + " 2>&1";
+
+    auto [out, rc] = core::run_shell_command(cmd);
+    if (!out.empty()) {
+        std::stringstream ss(out);
+        std::string line;
+        while (std::getline(ss, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.find('\t') == std::string::npos) continue;
+            TrackDetails td;
+            std::stringstream lss(line);
+            std::string dur_s;
+            std::getline(lss, td.vidid, '\t');
+            std::getline(lss, td.title, '\t');
+            std::getline(lss, dur_s, '\t');
+            std::getline(lss, td.link, '\t');
+            std::getline(lss, td.thumb, '\t');
+            if (!td.vidid.empty() && !td.title.empty()) {
+                try { td.duration_sec = static_cast<int>(std::stod(dur_s)); } catch (...) { td.duration_sec = 0; }
+                td.duration_min = td.duration_sec > 0 ? sec_to_min_str(td.duration_sec) : "Live";
+                td.link = is_valid_vidid(td.vidid) ? (base + td.vidid) : target;
+                td.thumb = "https://i.ytimg.com/vi/" + td.vidid + "/hqdefault.jpg";
+                return td;
+            }
+        }
+    }
+
+    std::string err_msg = "❌ لم يتم العثور على نتائج في يوتيوب لـ: " + query;
+    LOGGER("AnnieXMedia.platforms.Youtube").error(err_msg);
+    throw std::runtime_error(err_msg);
+}
+
+std::string YouTubeAPI::get_direct_link(const std::string& link, bool prefer_audio) {
+    std::string vid = extract_vid(link, false);
+    if (!is_valid_vidid(vid) && !exists(link) && link.rfind("http", 0) != 0) {
+        auto td = track(link, false);
+        vid = td.vidid;
+    }
+
+    std::string target_url = is_valid_vidid(vid) ? (base + vid) : link;
+    bool is_video = !prefer_audio;
+    std::string cache_key = (is_valid_vidid(vid) ? vid : target_url) + (is_video ? ":v" : ":a");
+    int64_t now = now_epoch();
+
+    {
+        std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
+        auto it = g_url_cache.find(cache_key);
+        if (it != g_url_cache.end() && it->second.second > now && !it->second.first.empty()) {
+            LOGGER("AnnieXMedia.platforms.Youtube").info("⚡ Using cached direct YouTube stream URL for " + cache_key);
+            return it->second.first;
+        }
+    }
+
+    if (is_valid_vidid(vid)) {
+        (void)innertube_player(vid, base);
+        std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
+        auto it = g_url_cache.find(cache_key);
+        if (it != g_url_cache.end() && it->second.second > now && !it->second.first.empty()) {
+            LOGGER("AnnieXMedia.platforms.Youtube").info(
+                "✅ Extracted direct YouTube URL via Innertube VISIONOS (cookie-free, " +
+                std::to_string(it->second.first.size()) + " chars)"
+            );
+            return it->second.first;
+        }
+    }
+
+    std::string media_format = is_video
+        ? "best[ext=mp4][height<=720]/best[height<=720]/best"
+        : "bestaudio[ext=m4a]/bestaudio/best";
+
+    auto extract_first_http_url = [prefer_audio](const std::string& output) -> std::string {
+        std::stringstream ss(output);
+        std::string line;
+        std::string chosen;
+        while (std::getline(ss, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) {
+                line.pop_back();
+            }
+            if (line.rfind("https://", 0) == 0 || line.rfind("http://", 0) == 0) {
+                chosen = line;
+                if (prefer_audio) break;
+            }
+        }
+        return chosen;
+    };
+
+    std::string fast_cmd =
+        "yt-dlp --no-cookies --force-ipv4 --source-address 0.0.0.0 --no-warnings --no-check-certificates "
+        "--no-playlist --socket-timeout 5 --retries 2 --cache-dir /tmp/ytdlp_cache "
+        "--extractor-args \"youtube:player_client=visionos,android;player_skip=webpage,configs,initial_data,js;skip=hls,dash,translated_subs;formats=missing_pot;fetch_pot=never\" "
+        "-g -f \"" + media_format + "\" " + shell_quote(target_url) + " 2>&1";
+
+    LOGGER("AnnieXMedia.platforms.Youtube").info("🔗 Pulling direct YouTube stream URL (cookie-free fast_opts): " + fast_cmd);
+    auto [fast_out, fast_rc] = core::run_shell_command(fast_cmd);
+    std::string direct_url = extract_first_http_url(fast_out);
+    if (!direct_url.empty()) {
+        std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
+        g_url_cache[cache_key] = {direct_url, now + CACHE_TTL_SEC};
+        LOGGER("AnnieXMedia.platforms.Youtube").info(
+            "✅ Successfully extracted direct YouTube URL via fast_opts (" + std::to_string(direct_url.size()) + " chars)"
+        );
+        return direct_url;
+    }
+
+    std::string fb_cmd =
+        "yt-dlp --no-cookies --force-ipv4 --source-address 0.0.0.0 --no-warnings --no-check-certificates "
+        "--no-playlist --cache-dir /tmp/ytdlp_cache "
+        "--remote-components ejs:github "
+        "--extractor-args \"youtube:player_client=tv_samsung,web_embedded;player_skip=webpage,initial_data;skip=translated_subs;fetch_pot=never\" "
+        "-g -f \"" + media_format + "\" " + shell_quote(target_url) + " 2>&1";
+
+    LOGGER("AnnieXMedia.platforms.Youtube").info("🔄 Trying fallback_opts (tv_samsung,web_embedded cookie-free): " + fb_cmd);
+    auto [fb_out, fb_rc] = core::run_shell_command(fb_cmd);
+    direct_url = extract_first_http_url(fb_out);
+    if (!direct_url.empty()) {
+        std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
+        g_url_cache[cache_key] = {direct_url, now + CACHE_TTL_SEC};
+        LOGGER("AnnieXMedia.platforms.Youtube").info(
+            "✅ Successfully extracted direct YouTube URL via fallback_opts (" + std::to_string(direct_url.size()) + " chars)"
+        );
+        return direct_url;
+    }
+
+    std::string full_reason =
+        "❌ تعذر استخراج الرابط المباشر من يوتيوب (بدون كوكيز)!\n"
+        "• الرابط المطلوب: " + target_url + "\n"
+        "• رد محرك الاستخراج:\n" + (fb_out.empty() ? fast_out : fb_out);
+
+    LOGGER("AnnieXMedia.platforms.Youtube").error(full_reason);
+    throw std::runtime_error(full_reason);
+}
+
+std::string YouTubeAPI::download(const std::string& query_or_link, bool is_video, bool is_videoid) {
+    std::string vid = extract_vid(query_or_link, is_videoid);
+    std::string target = is_valid_vidid(vid) ? (base + vid) : query_or_link;
+    if (!is_valid_vidid(vid) && !exists(target) && target.rfind("http", 0) != 0) {
+        auto td = track(target, false);
+        target = td.link;
+    }
+    return get_direct_link(target, !is_video);
+}
+
+std::vector<TrackDetails> YouTubeAPI::playlist(const std::string& link, int limit) {
+    std::vector<TrackDetails> list;
+    std::string target = link;
+    if (target.find('&') != std::string::npos && target.find("list=") != std::string::npos) {
+        auto lpos = target.find("list=");
+        std::string list_id = target.substr(lpos + 5);
+        auto amp = list_id.find('&');
+        if (amp != std::string::npos) list_id = list_id.substr(0, amp);
+        target = listbase + list_id;
+    }
+
+    std::string cmd =
+        "yt-dlp --no-cookies --force-ipv4 --no-warnings --no-check-certificates --flat-playlist "
+        "--playlist-end " + std::to_string(limit > 0 ? limit : 25) + " "
+        "--extractor-args \"youtubetab:skip=webpage\" "
+        "--print \"%(id)s\t%(title)s\t%(duration)s\" " + shell_quote(target) + " 2>&1";
+
+    auto [out, rc] = core::run_shell_command(cmd);
+    if (rc == 0 && !out.empty()) {
+        std::stringstream ss(out);
+        std::string line;
+        while (std::getline(ss, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.find('\t') == std::string::npos) continue;
+            TrackDetails td;
+            std::stringstream lss(line);
+            std::string dur_s;
+            std::getline(lss, td.vidid, '\t');
+            std::getline(lss, td.title, '\t');
+            std::getline(lss, dur_s, '\t');
+            try { td.duration_sec = std::stoi(dur_s); } catch (...) { td.duration_sec = 180; }
+            td.duration_min = sec_to_min_str(td.duration_sec);
+            td.link = base + td.vidid;
+            td.thumb = "https://i.ytimg.com/vi/" + td.vidid + "/hqdefault.jpg";
+            list.push_back(td);
+        }
     } else {
-        DOWNLOAD_PATH = "downloads";
+        LOGGER("AnnieXMedia.platforms.Youtube").error("❌ YouTube playlist error:\n" + out);
     }
-    std::filesystem::create_directories(DOWNLOAD_PATH);
-
-    AUTO_DOWNLOADS_CLEAR = getenv_str("AUTO_DOWNLOADS_CLEAR", "True");
-    MONGO_DB_URI = raw_mongo;
-    LOGGER_ID = getenv_int("LOGGER_ID", -1004295349964LL);
-
-    DURATION_LIMIT_MIN = static_cast<int>(getenv_int("DURATION_LIMIT", 600));
-    DURATION_LIMIT = time_to_seconds(std::to_string(DURATION_LIMIT_MIN) + ":00");
-    SONG_DOWNLOAD_DURATION = static_cast<int>(getenv_int("SONG_DOWNLOAD_DURATION", 3600));
-    SONG_DOWNLOAD_DURATION_LIMIT = static_cast<int>(getenv_int("SONG_DOWNLOAD_DURATION_LIMIT", 5400));
-    TG_AUDIO_FILESIZE_LIMIT = getenv_int("TG_AUDIO_FILESIZE_LIMIT", 2147483648LL);
-    TG_VIDEO_FILESIZE_LIMIT = getenv_int("TG_VIDEO_FILESIZE_LIMIT", 2147483648LL);
-    PLAYLIST_FETCH_LIMIT = static_cast<int>(getenv_int("PLAYLIST_FETCH_LIMIT", 100));
-    AI_HANDLER_GROUP = static_cast<int>(getenv_int("AI_HANDLER_GROUP", 30));
-    SERVER_PLAYLIST_LIMIT = static_cast<int>(getenv_int("SERVER_PLAYLIST_LIMIT", 30));
-
-    COOKIE_URL = getenv_str("COOKIE_URL", "");
-    API_URL = getenv_str("API_URL", "https://hyperionengine.fly.dev");
-    VIDEO_API_URL = getenv_str("VIDEO_API_URL", "https://hyperionengine.fly.dev");
-    API_KEY = getenv_str("API_KEY", "");
-    DEEP_API = getenv_str("DEEP_API", "");
-    AI_API_KEY = getenv_str("GPT_4", "");
-
-    HEROKU_APP_NAME = getenv_str("HEROKU_APP_NAME", "");
-    HEROKU_API_KEY = getenv_str("HEROKU_API_KEY", "");
-    UPSTREAM_REPO = getenv_str("UPSTREAM_REPO", "https://t.me/SourceBoda");
-    UPSTREAM_BRANCH = getenv_str("UPSTREAM_BRANCH", "Master");
-    GIT_TOKEN = getenv_str("GIT_TOKEN", "");
-    SUPPORT_CHANNEL = getenv_str("SUPPORT_CHANNEL", "https://t.me/SourceBoda");
-    SUPPORT_CHAT = getenv_str("SUPPORT_CHAT", "https://t.me/music0587");
-
-    AUTO_LEAVING_ASSISTANT = getenv_str("AUTO_LEAVING_ASSISTANT", "False");
-    AUTO_LEAVE_ASSISTANT_TIME = static_cast<int>(getenv_int("ASSISTANT_LEAVE_TIME", 3600));
-    SPOTIFY_CLIENT_ID = getenv_str("SPOTIFY_CLIENT_ID", "22b6125bfe224587b722d6815002db2b");
-    SPOTIFY_CLIENT_SECRET = getenv_str("SPOTIFY_CLIENT_SECRET", "c9c63c6fbf2f467c8bc68624851e9773");
-
-    STRING1 = raw_session.empty() ? "assistant_1" : raw_session;
-    STRING2 = getenv_str("STRING_SESSION2", getenv_str("STRING2", ""));
-    STRING3 = getenv_str("STRING_SESSION3", getenv_str("STRING3", ""));
-    STRING4 = getenv_str("STRING_SESSION4", getenv_str("STRING4", ""));
-    STRING5 = getenv_str("STRING_SESSION5", getenv_str("STRING5", ""));
-
-    std::regex url_re("^https?://");
-    if (!SUPPORT_CHANNEL.empty() && !std::regex_search(SUPPORT_CHANNEL, url_re)) {
-        if (SUPPORT_CHANNEL[0] == '@') SUPPORT_CHANNEL.erase(SUPPORT_CHANNEL.begin());
-        SUPPORT_CHANNEL = "https://t.me/" + SUPPORT_CHANNEL;
-    }
-    if (!SUPPORT_CHAT.empty() && !std::regex_search(SUPPORT_CHAT, url_re)) {
-        if (SUPPORT_CHAT[0] == '@') SUPPORT_CHAT.erase(SUPPORT_CHAT.begin());
-        SUPPORT_CHAT = "https://t.me/" + SUPPORT_CHAT;
-    }
+    return list;
 }
 
-} // namespace config
+} // namespace AnnieXMedia::platforms
 EOF
 
-# ------------------------------------------------------------------
-# 4. تحديث AnnieXMedia/core/bot.cpp مع ضمان إرسال رسائل السجل عبر TDLib + Bot API Fallback
-# ------------------------------------------------------------------
 cat << 'EOF' > AnnieXMedia/core/bot.cpp
 #include "AnnieXMedia/core/bot.hpp"
 #include "AnnieXMedia/logging.hpp"
 #include "config.hpp"
+
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
-#include <unistd.h>
+#include <regex>
+#include <thread>
+#include <unordered_map>
 
 namespace AnnieXMedia::core {
 
 MusicBotClient app;
 
-static bool send_via_bot_api_http_single(int64_t target_chat_id, const std::string& html_text,
-                                         int64_t reply_to_message_id, bool disable_preview) {
-    if (config::BOT_TOKEN.empty()) return false;
-    static std::atomic<int> msg_counter{0};
-    std::string tmp_file = "/tmp/annie_msg_" + std::to_string(::getpid()) + "_" + std::to_string(msg_counter.fetch_add(1)) + ".txt";
-    {
-        std::ofstream out(tmp_file, std::ios::binary);
-        if (!out.is_open()) return false;
-        out << html_text;
-    }
+static std::mutex g_cache_mtx;
+static std::unordered_map<int64_t, std::pair<std::string, std::string>> g_user_cache;
+static std::unordered_map<int64_t, std::pair<std::string, std::string>> g_chat_cache;
+static std::unordered_map<int64_t, int64_t> g_msg_id_map;
 
-    std::string cmd = "curl -s -X POST \"https://api.telegram.org/bot" + config::BOT_TOKEN + "/sendMessage\""
-                      " -d \"chat_id=" + std::to_string(target_chat_id) + "\""
-                      " -d \"parse_mode=HTML\""
-                      " -d \"disable_web_page_preview=" + std::string(disable_preview ? "true" : "false") + "\"";
-    if (reply_to_message_id > 0) {
-        cmd += " -d \"reply_to_message_id=" + std::to_string(reply_to_message_id) + "\"";
-    }
-    cmd += " --data-urlencode \"text@" + tmp_file + "\"";
-
-    std::string output;
-    if (FILE* pipe = ::popen(cmd.c_str(), "r")) {
-        char buf[512];
-        while (std::fgets(buf, sizeof(buf), pipe) != nullptr) {
-            output += buf;
+static int64_t resolve_message_id(int64_t msg_id) {
+    if (msg_id == 0) return 0;
+    for (int i = 0; i < 12; ++i) {
+        {
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            auto it = g_msg_id_map.find(msg_id);
+            if (it != g_msg_id_map.end()) return it->second;
         }
-        ::pclose(pipe);
+        if ((msg_id & 0xFFFFF) == 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    std::filesystem::remove(tmp_file);
-    return output.find("\"ok\":true") != std::string::npos;
+    return msg_id;
 }
 
-static bool send_via_bot_api_http(int64_t chat_id, const std::string& html_text,
-                                  int64_t reply_to_message_id = 0, bool disable_preview = true) {
-    if (send_via_bot_api_http_single(chat_id, html_text, reply_to_message_id, disable_preview)) {
-        return true;
+static std::string fix_html_links(const std::string& html) {
+    static const std::regex unquoted_href(R"(<a\s+href=([^"'\s>]+)>)");
+    return std::regex_replace(html, unquoted_href, "<a href=\"$1\">");
+}
+
+static std::string ensure_local_image(const std::string& path_or_url) {
+    if (path_or_url.empty()) return "";
+    if (std::filesystem::exists(path_or_url) && std::filesystem::file_size(path_or_url) > 256) {
+        return path_or_url;
     }
-    if (chat_id < -1000000000000LL) {
-        int64_t basic_group_chat_id = -((-chat_id) - 1000000000000LL);
-        if (send_via_bot_api_http_single(basic_group_chat_id, html_text, reply_to_message_id, disable_preview)) {
-            return true;
+    if (path_or_url.rfind("http://", 0) == 0 || path_or_url.rfind("https://", 0) == 0) {
+        std::filesystem::create_directories(config::DOWNLOAD_PATH + "/thumbs");
+        std::string hash_name = std::to_string(std::hash<std::string>{}(path_or_url));
+        std::string local_file = config::DOWNLOAD_PATH + "/thumbs/img_" + hash_name + ".jpg";
+        if (std::filesystem::exists(local_file) && std::filesystem::file_size(local_file) > 512) {
+            return local_file;
+        }
+        std::string cmd = "curl -4 -sL --max-time 8 -A \"Mozilla/5.0\" \"" + path_or_url + "\" -o \"" + local_file + "\"";
+        (void)std::system(cmd.c_str());
+        if (std::filesystem::exists(local_file) && std::filesystem::file_size(local_file) > 512) {
+            return local_file;
         }
     }
-    return false;
+    return "";
 }
 
 MusicBotClient::MusicBotClient() {
-    td::ClientManager::execute(td_api::make_object<td_api::setLogVerbosityLevel>(1));
+    td::ClientManager::execute(td_api::make_object<td_api::setLogVerbosityLevel>(0));
     client_manager_ = std::make_unique<td::ClientManager>();
     client_id_ = client_manager_->create_client_id();
     LOGGER("AnnieXMedia.core.bot").info("Bot client initialized with native C++ TDLib engine.");
@@ -877,16 +1638,13 @@ void MusicBotClient::on_authorization_state_update(td_api::object_ptr<td_api::Au
         }
         case td_api::authorizationStateWaitPhoneNumber::ID: {
             if (config::BOT_TOKEN.empty() || config::BOT_TOKEN.find(':') == std::string::npos) {
-                LOGGER("AnnieXMedia.core.bot").error(
-                    "⚠️ قيمة BOT_TOKEN في السكرتس غير صحيحة (القيمة الحالية: [" + config::BOT_TOKEN + "]). "
-                    "يجب أن يكون التوكن من @BotFather بالصيغة: 123456789:ABCdefGHIjklMNOpqrSTUvwxYZ"
-                );
+                LOGGER("AnnieXMedia.core.bot").error("⚠️ قيمة BOT_TOKEN في السكرتس غير صحيحة!");
             } else {
                 send_query(td_api::make_object<td_api::checkAuthenticationBotToken>(config::BOT_TOKEN),
                            [](td_api::object_ptr<td_api::Object> obj) {
                                if (obj && obj->get_id() == td_api::error::ID) {
                                    auto* err = static_cast<const td_api::error*>(obj.get());
-                                   LOGGER("AnnieXMedia.core.bot").error("❌ خطأ في checkAuthenticationBotToken (تأكد من BOT_TOKEN): [" + std::to_string(err->code_) + "] " + err->message_);
+                                   LOGGER("AnnieXMedia.core.bot").error("❌ خطأ في checkAuthenticationBotToken: [" + std::to_string(err->code_) + "] " + err->message_);
                                }
                            });
             }
@@ -904,9 +1662,42 @@ void MusicBotClient::on_authorization_state_update(td_api::object_ptr<td_api::Au
 
 void MusicBotClient::process_update(td_api::object_ptr<td_api::Object> update) {
     if (!update) return;
+
     if (update->get_id() == td_api::updateAuthorizationState::ID) {
         auto u = td_api::move_object_as<td_api::updateAuthorizationState>(update);
         on_authorization_state_update(std::move(u->authorization_state_));
+        return;
+    }
+
+    if (update->get_id() == td_api::updateUser::ID) {
+        auto u = td_api::move_object_as<td_api::updateUser>(update);
+        if (u->user_) {
+            std::string full_name = u->user_->first_name_ + (u->user_->last_name_.empty() ? "" : (" " + u->user_->last_name_));
+            std::string uname;
+            if (u->user_->usernames_ && !u->user_->usernames_->active_usernames_.empty()) {
+                uname = u->user_->usernames_->active_usernames_[0];
+            }
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            g_user_cache[u->user_->id_] = {full_name, uname};
+        }
+        return;
+    }
+
+    if (update->get_id() == td_api::updateNewChat::ID) {
+        auto u = td_api::move_object_as<td_api::updateNewChat>(update);
+        if (u->chat_) {
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            g_chat_cache[u->chat_->id_].first = u->chat_->title_;
+        }
+        return;
+    }
+
+    if (update->get_id() == td_api::updateMessageSendSucceeded::ID) {
+        auto u = td_api::move_object_as<td_api::updateMessageSendSucceeded>(update);
+        if (u->message_) {
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            g_msg_id_map[u->old_message_id_] = u->message_->id_;
+        }
         return;
     }
 
@@ -924,7 +1715,24 @@ void MusicBotClient::process_update(td_api::object_ptr<td_api::Object> update) {
         if (u->message_->sender_id_ && u->message_->sender_id_->get_id() == td_api::messageSenderUser::ID) {
             auto* sender = static_cast<const td_api::messageSenderUser*>(u->message_->sender_id_.get());
             msg.sender_user_id = sender->user_id_;
+            {
+                std::lock_guard<std::mutex> lk(g_cache_mtx);
+                auto it = g_user_cache.find(msg.sender_user_id);
+                if (it != g_user_cache.end()) {
+                    msg.sender_first_name = it->second.first;
+                    msg.sender_username = it->second.second;
+                }
+            }
         }
+        {
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            auto it = g_chat_cache.find(msg.chat_id);
+            if (it != g_chat_cache.end()) {
+                msg.chat_title = it->second.first;
+                msg.chat_username = it->second.second;
+            }
+        }
+
         if (u->message_->reply_to_ && u->message_->reply_to_->get_id() == td_api::messageReplyToMessage::ID) {
             auto* rep = static_cast<const td_api::messageReplyToMessage*>(u->message_->reply_to_.get());
             msg.reply_to_message_id = rep->message_id_;
@@ -1002,7 +1810,23 @@ void MusicBotClient::process_update(td_api::object_ptr<td_api::Object> update) {
             std::lock_guard<std::mutex> lock(handlers_mutex_);
             handlers = message_handlers_;
         }
-        std::thread([handlers, msg]() {
+        std::thread([this, handlers, msg]() mutable {
+            if (msg.sender_first_name.empty() && msg.sender_user_id != 0) {
+                auto u_obj = this->send_query_sync(td_api::make_object<td_api::getUser>(msg.sender_user_id), 2);
+                if (u_obj && u_obj->get_id() == td_api::user::ID) {
+                    auto* usr = static_cast<const td_api::user*>(u_obj.get());
+                    msg.sender_first_name = usr->first_name_ + (usr->last_name_.empty() ? "" : (" " + usr->last_name_));
+                    if (usr->usernames_ && !usr->usernames_->active_usernames_.empty()) {
+                        msg.sender_username = usr->usernames_->active_usernames_[0];
+                    }
+                }
+            }
+            if (msg.chat_title.empty()) {
+                auto c_obj = this->send_query_sync(td_api::make_object<td_api::getChat>(msg.chat_id), 2);
+                if (c_obj && c_obj->get_id() == td_api::chat::ID) {
+                    msg.chat_title = static_cast<const td_api::chat*>(c_obj.get())->title_;
+                }
+            }
             for (const auto& h : handlers) {
                 try {
                     if (h(msg)) break;
@@ -1021,6 +1845,14 @@ void MusicBotClient::process_update(td_api::object_ptr<td_api::Object> update) {
         cb.chat_id = u->chat_id_;
         cb.message_id = u->message_id_;
         cb.sender_user_id = u->sender_user_id_;
+        {
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            auto it = g_user_cache.find(cb.sender_user_id);
+            if (it != g_user_cache.end()) {
+                cb.sender_first_name = it->second.first;
+                cb.sender_username = it->second.second;
+            }
+        }
         if (u->payload_ && u->payload_->get_id() == td_api::callbackQueryPayloadData::ID) {
             auto* p = static_cast<const td_api::callbackQueryPayloadData*>(u->payload_.get());
             cb.data = p->data_;
@@ -1088,18 +1920,23 @@ void MusicBotClient::start() {
             this->username = config::BOT_USERNAME;
         }
         this->mention = "<a href=\"tg://user?id=" + std::to_string(this->id) + "\">" + this->name + "</a>";
+        config::BOT_USERNAME = this->username;
+        config::BOT_NAME = this->name;
     } else {
         this->name = config::BOT_NAME;
         this->username = config::BOT_USERNAME;
     }
 
-    std::string start_msg =
-        "<u><b>» " + this->mention + " ʙᴏᴛ sᴛᴀʀᴛᴇᴅ (C++ TDLib & Native NTgCalls) :</b></u>\n\n"
-        "ɪᴅ : <code>" + std::to_string(this->id) + "</code>\n"
-        "ɴᴀᴍᴇ : " + this->name + "\n"
-        "ᴜsᴇʀɴᴀᴍᴇ : @" + this->username;
-
-    send_message(config::LOGGER_ID, start_msg);
+    if (config::LOGGER_ID != 0) {
+        (void)send_query_sync(td_api::make_object<td_api::getChat>(config::LOGGER_ID), 3);
+        send_message(
+            config::LOGGER_ID,
+            "<u><b>» " + this->mention + " ʙᴏᴛ sᴛᴀʀᴛᴇᴅ (C++ TDLib & Native NTgCalls) :</b></u>\n\n"
+            "ɪᴅ : <code>" + std::to_string(this->id) + "</code>\n"
+            "ɴᴀᴍᴇ : " + this->name + "\n"
+            "ᴜsᴇʀɴᴀᴍᴇ : @" + this->username
+        );
+    }
 
     LOGGER("AnnieXMedia.core.bot").info("✅ Music Bot started as " + this->name + " (@" + this->username + ")");
 }
@@ -1127,14 +1964,19 @@ void MusicBotClient::on_callback_query(CallbackHandlerFn fn) {
 }
 
 td_api::object_ptr<td_api::formattedText> MusicBotClient::parse_html_text(const std::string& html) const {
+    std::string fixed_html = fix_html_links(html);
     auto res = td::ClientManager::execute(
-        td_api::make_object<td_api::parseTextEntities>(html, td_api::make_object<td_api::textParseModeHTML>())
+        td_api::make_object<td_api::parseTextEntities>(fixed_html, td_api::make_object<td_api::textParseModeHTML>())
     );
     if (res && res->get_id() == td_api::formattedText::ID) {
         return td_api::move_object_as<td_api::formattedText>(res);
     }
+    if (res && res->get_id() == td_api::error::ID) {
+        auto* err = static_cast<const td_api::error*>(res.get());
+        LOGGER("AnnieXMedia.core.bot").warning("⚠️ HTML Parse warning: " + err->message_ + " | input: " + fixed_html);
+    }
     auto ft = td_api::make_object<td_api::formattedText>();
-    ft->text_ = html;
+    ft->text_ = fixed_html;
     return ft;
 }
 
@@ -1166,20 +2008,11 @@ int64_t MusicBotClient::send_message(int64_t chat_id, const std::string& text,
                                      const InlineKeyboardMarkup& reply_markup,
                                      int64_t reply_to_message_id,
                                      bool disable_web_page_preview) {
-    if (chat_id > 0) {
-        send_query(td_api::make_object<td_api::createPrivateChat>(chat_id, true));
-    } else if (chat_id < -1000000000000LL) {
-        int64_t sg_id = (-chat_id) - 1000000000000LL;
-        send_query(td_api::make_object<td_api::createSupergroupChat>(sg_id, true));
-    } else if (chat_id < 0) {
-        send_query(td_api::make_object<td_api::createBasicGroupChat>(-chat_id, true));
-    }
-
     auto req = td_api::make_object<td_api::sendMessage>();
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
         auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
-        rep->message_id_ = reply_to_message_id;
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
         req->reply_to_ = std::move(rep);
     }
     req->reply_markup_ = build_reply_markup(reply_markup);
@@ -1193,16 +2026,13 @@ int64_t MusicBotClient::send_message(int64_t chat_id, const std::string& text,
     }
     req->input_message_content_ = std::move(content);
 
-    auto resp = send_query_sync(std::move(req), 5);
+    auto resp = send_query_sync(std::move(req), 8);
     if (resp && resp->get_id() == td_api::message::ID) {
         return static_cast<const td_api::message*>(resp.get())->id_;
     }
-
-    if (send_via_bot_api_http(chat_id, text, reply_to_message_id, disable_web_page_preview)) {
-        return 1;
-    }
-    if (chat_id == config::LOGGER_ID && config::OWNER_ID != 0 && config::OWNER_ID != chat_id) {
-        send_via_bot_api_http(config::OWNER_ID, text, 0, disable_web_page_preview);
+    if (resp && resp->get_id() == td_api::error::ID && chat_id != config::LOGGER_ID) {
+        auto* err = static_cast<const td_api::error*>(resp.get());
+        LOGGER("AnnieXMedia.core.bot").error("❌ send_message error in chat " + std::to_string(chat_id) + ": [" + std::to_string(err->code_) + "] " + err->message_);
     }
     return 0;
 }
@@ -1211,18 +2041,21 @@ int64_t MusicBotClient::send_photo(int64_t chat_id, const std::string& photo_pat
                                    const std::string& caption,
                                    const InlineKeyboardMarkup& reply_markup,
                                    int64_t reply_to_message_id) {
+    std::string local_img = ensure_local_image(photo_path_or_url);
     auto req = td_api::make_object<td_api::sendMessage>();
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
         auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
-        rep->message_id_ = reply_to_message_id;
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
         req->reply_to_ = std::move(rep);
     }
     req->reply_markup_ = build_reply_markup(reply_markup);
 
     auto content = td_api::make_object<td_api::inputMessagePhoto>();
     auto ip = td_api::make_object<td_api::inputPhoto>();
-    if (std::filesystem::exists(photo_path_or_url)) {
+    if (!local_img.empty()) {
+        ip->photo_ = td_api::make_object<td_api::inputFileLocal>(local_img);
+    } else if (std::filesystem::exists(photo_path_or_url)) {
         ip->photo_ = td_api::make_object<td_api::inputFileLocal>(photo_path_or_url);
     } else {
         ip->photo_ = td_api::make_object<td_api::inputFileRemote>(photo_path_or_url);
@@ -1231,9 +2064,13 @@ int64_t MusicBotClient::send_photo(int64_t chat_id, const std::string& photo_pat
     content->caption_ = parse_html_text(caption);
     req->input_message_content_ = std::move(content);
 
-    auto resp = send_query_sync(std::move(req), 10);
+    auto resp = send_query_sync(std::move(req), 12);
     if (resp && resp->get_id() == td_api::message::ID) {
         return static_cast<const td_api::message*>(resp.get())->id_;
+    }
+    if (resp && resp->get_id() == td_api::error::ID) {
+        auto* err = static_cast<const td_api::error*>(resp.get());
+        LOGGER("AnnieXMedia.core.bot").warning("⚠️ send_photo fallback to text (reason: " + err->message_ + ")");
     }
     return send_message(chat_id, caption, reply_markup, reply_to_message_id);
 }
@@ -1246,7 +2083,7 @@ int64_t MusicBotClient::send_audio(int64_t chat_id, const std::string& audio_pat
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
         auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
-        rep->message_id_ = reply_to_message_id;
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
         req->reply_to_ = std::move(rep);
     }
     req->reply_markup_ = build_reply_markup(reply_markup);
@@ -1277,7 +2114,7 @@ int64_t MusicBotClient::send_video(int64_t chat_id, const std::string& video_pat
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
         auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
-        rep->message_id_ = reply_to_message_id;
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
         req->reply_to_ = std::move(rep);
     }
     req->reply_markup_ = build_reply_markup(reply_markup);
@@ -1306,7 +2143,7 @@ int64_t MusicBotClient::send_document(int64_t chat_id, const std::string& doc_pa
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
         auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
-        rep->message_id_ = reply_to_message_id;
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
         req->reply_to_ = std::move(rep);
     }
     auto content = td_api::make_object<td_api::inputMessageDocument>();
@@ -1327,7 +2164,7 @@ int64_t MusicBotClient::send_sticker(int64_t chat_id, const std::string& sticker
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
         auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
-        rep->message_id_ = reply_to_message_id;
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
         req->reply_to_ = std::move(rep);
     }
     auto content = td_api::make_object<td_api::inputMessageSticker>();
@@ -1347,7 +2184,7 @@ int64_t MusicBotClient::send_dice(int64_t chat_id, const std::string& emoji, int
     req->chat_id_ = chat_id;
     if (reply_to_message_id != 0) {
         auto rep = td_api::make_object<td_api::inputMessageReplyToMessage>();
-        rep->message_id_ = reply_to_message_id;
+        rep->message_id_ = resolve_message_id(reply_to_message_id);
         req->reply_to_ = std::move(rep);
     }
     auto content = td_api::make_object<td_api::inputMessageDice>(emoji, false);
@@ -1361,28 +2198,35 @@ int64_t MusicBotClient::send_dice(int64_t chat_id, const std::string& emoji, int
 
 void MusicBotClient::edit_message_text(int64_t chat_id, int64_t message_id, const std::string& text,
                                        const InlineKeyboardMarkup& reply_markup) {
+    int64_t real_id = resolve_message_id(message_id);
     auto req = td_api::make_object<td_api::editMessageText>();
     req->chat_id_ = chat_id;
-    req->message_id_ = message_id;
+    req->message_id_ = real_id;
     req->reply_markup_ = build_reply_markup(reply_markup);
     auto content = td_api::make_object<td_api::inputMessageText>();
     content->text_ = parse_html_text(text);
     req->input_message_content_ = std::move(content);
-    send_query(std::move(req));
+    send_query(std::move(req), [this, chat_id, text, reply_markup](td_api::object_ptr<td_api::Object> obj) {
+        if (obj && obj->get_id() == td_api::error::ID) {
+            this->send_message(chat_id, text, reply_markup);
+        }
+    });
 }
 
 void MusicBotClient::edit_message_caption(int64_t chat_id, int64_t message_id, const std::string& caption,
                                           const InlineKeyboardMarkup& reply_markup) {
+    int64_t real_id = resolve_message_id(message_id);
     auto req = td_api::make_object<td_api::editMessageCaption>();
     req->chat_id_ = chat_id;
-    req->message_id_ = message_id;
+    req->message_id_ = real_id;
     req->reply_markup_ = build_reply_markup(reply_markup);
     req->caption_ = parse_html_text(caption);
     send_query(std::move(req));
 }
 
 void MusicBotClient::delete_message(int64_t chat_id, int64_t message_id) {
-    delete_messages(chat_id, {message_id});
+    int64_t real_id = resolve_message_id(message_id);
+    delete_messages(chat_id, {real_id, message_id});
 }
 
 void MusicBotClient::delete_messages(int64_t chat_id, const std::vector<int64_t>& message_ids) {
@@ -1589,116 +2433,14 @@ std::string MusicBotClient::download_file(const std::string& remote_file_id) {
 } // namespace AnnieXMedia::core
 EOF
 
-# ------------------------------------------------------------------
-# 5. تحديث AnnieXMedia/core/userbot.hpp و AnnieXMedia/core/userbot.cpp
-# ------------------------------------------------------------------
-cat << 'EOF' > AnnieXMedia/core/userbot.hpp
-#pragma once
-
-#include <td/telegram/Client.h>
-#include <td/telegram/td_api.h>
-#include <td/telegram/td_api.hpp>
-
-#include <atomic>
-#include <cstdint>
-#include <functional>
-#include <future>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <string>
-#include <thread>
-#include <vector>
-
-namespace AnnieXMedia::core {
-
-namespace td_api = td::td_api;
-
-extern std::vector<int> assistants;
-extern std::vector<int64_t> assistantids;
-
-class AssistantClient {
-    int index_;
-    std::string session_config_;
-    std::unique_ptr<td::ClientManager> client_manager_;
-    int32_t client_id_{0};
-    std::atomic<uint64_t> query_id_{1};
-    std::atomic<bool> running_{false};
-    std::atomic<bool> authorized_{false};
-    std::atomic<bool> waiting_code_{false};
-    std::atomic<bool> waiting_password_{false};
-    std::atomic<bool> finalized_{false};
-    std::string password_hint_;
-    std::mutex mtx_;
-    std::map<uint64_t, std::function<void(td_api::object_ptr<td_api::Object>)>> callbacks_;
-    std::map<int64_t, int32_t> chat_group_call_ids_;
-    std::thread worker_;
-
-    void process_response(td::ClientManager::Response response);
-    void on_auth_state(td_api::object_ptr<td_api::AuthorizationState> state);
-
-public:
-    int64_t id = 0;
-    std::string name;
-    std::string username;
-
-    AssistantClient(int index, std::string session_config);
-    ~AssistantClient();
-
-    void send_query(td_api::object_ptr<td_api::Function> f,
-                    std::function<void(td_api::object_ptr<td_api::Object>)> cb = {});
-    td_api::object_ptr<td_api::Object> send_query_sync(td_api::object_ptr<td_api::Function> f, int timeout_sec = 10);
-
-    bool start();
-    void stop();
-    void finalize_authorization();
-    bool is_active() const { return running_.load(); }
-    bool is_authorized() const { return authorized_.load(); }
-    bool is_waiting_code() const { return waiting_code_.load(); }
-    bool is_waiting_password() const { return waiting_password_.load(); }
-    std::string get_password_hint() {
-        std::lock_guard<std::mutex> lock(mtx_);
-        return password_hint_;
-    }
-
-    int32_t get_or_create_group_call_id(int64_t chat_id, bool auto_create = true);
-    std::string join_group_call_signaling(int64_t chat_id, const std::string& join_payload_json,
-                                          int32_t audio_source_ssrc, bool is_muted, bool is_video_enabled);
-    bool leave_group_call_signaling(int64_t chat_id, bool end_call = false);
-    bool set_call_volume(int64_t chat_id, int volume_percent);
-    std::vector<int64_t> get_call_participants(int64_t chat_id);
-    bool join_chat_by_link_or_username(const std::string& link_or_username);
-    bool leave_chat(int64_t chat_id);
-    void send_message(int64_t chat_id, const std::string& text);
-};
-
-class Userbot {
-public:
-    std::shared_ptr<AssistantClient> one;
-    std::shared_ptr<AssistantClient> two;
-    std::shared_ptr<AssistantClient> three;
-    std::shared_ptr<AssistantClient> four;
-    std::shared_ptr<AssistantClient> five;
-
-    Userbot();
-    void start();
-    void stop();
-    std::shared_ptr<AssistantClient> get_by_index(int index) const;
-};
-
-extern Userbot userbot;
-
-} // namespace AnnieXMedia::core
-EOF
-
 cat << 'EOF' > AnnieXMedia/core/userbot.cpp
 #include "AnnieXMedia/core/userbot.hpp"
 #include "AnnieXMedia/core/bot.hpp"
 #include "AnnieXMedia/logging.hpp"
 #include "config.hpp"
+
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <regex>
@@ -1711,6 +2453,7 @@ Userbot userbot;
 
 AssistantClient::AssistantClient(int index, std::string session_config)
     : index_(index), session_config_(std::move(session_config)) {
+    td::ClientManager::execute(td_api::make_object<td_api::setLogVerbosityLevel>(0));
     client_manager_ = std::make_unique<td::ClientManager>();
     client_id_ = client_manager_->create_client_id();
 }
@@ -1741,51 +2484,6 @@ td_api::object_ptr<td_api::Object> AssistantClient::send_query_sync(td_api::obje
     return nullptr;
 }
 
-void AssistantClient::finalize_authorization() {
-    if (finalized_.exchange(true)) return;
-
-    auto me_obj = send_query_sync(td_api::make_object<td_api::getMe>(), 8);
-    if (me_obj && me_obj->get_id() == td_api::user::ID) {
-        auto me = td_api::move_object_as<td_api::user>(me_obj);
-        id = me->id_;
-        name = me->first_name_ + (me->last_name_.empty() ? "" : (" " + me->last_name_));
-        if (me->usernames_ && !me->usernames_->active_usernames_.empty()) {
-            username = me->usernames_->active_usernames_[0];
-        } else {
-            username = config::ASSUSERNAME;
-        }
-    } else {
-        name = "AnnieAssis" + std::to_string(index_);
-        username = config::ASSUSERNAME;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-        if (std::find(assistants.begin(), assistants.end(), index_) == assistants.end()) {
-            assistants.push_back(index_);
-        }
-        if (id != 0 && std::find(assistantids.begin(), assistantids.end(), id) == assistantids.end()) {
-            assistantids.push_back(id);
-        }
-    }
-
-    LOGGER("AnnieXMedia.core.userbot").info(
-        "☔ تم تشغيل المساعد " + std::to_string(index_) + " بنجاح بهوية: " + name + " (@" + username + ") [ID: " + std::to_string(id) + "]"
-    );
-
-    if (std::system("python3 /usr/local/bin/td_session_sync.py backup >/dev/null 2>&1 &") != 0) {}
-
-    std::string log_msg =
-        "<u><b>☔ تم تشغيل الحساب المساعد " + std::to_string(index_) + " بنجاح :</b></u>\n\n"
-        "• <b>الاسم :</b> " + name + "\n"
-        "• <b>الآيدي :</b> <code>" + std::to_string(id) + "</code>\n"
-        "• <b>اليوزر :</b> @" + username + "\n"
-        "• <b>الحالة :</b> متصل وجاهز لتشغيل الميديا في المكالمات 🤍";
-
-    app.send_message(config::LOGGER_ID, log_msg);
-    send_message(config::LOGGER_ID, "☔ تم بدء تشغيل الحساب المساعد " + std::to_string(index_) + " (" + name + ") بنجاح 🤍");
-}
-
 void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationState> state) {
     if (!state) return;
     switch (state->get_id()) {
@@ -1802,7 +2500,12 @@ void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationStat
             req->device_model_ = "AnnieAssis" + std::to_string(index_);
             req->system_version_ = "Linux";
             req->application_version_ = "3.0.0";
-            send_query(std::move(req));
+            send_query(std::move(req), [this](td_api::object_ptr<td_api::Object> obj) {
+                if (obj && obj->get_id() == td_api::error::ID) {
+                    auto* err = static_cast<const td_api::error*>(obj.get());
+                    LOGGER("AnnieXMedia.core.userbot").error("❌ خطأ في setTdlibParameters للمساعد " + std::to_string(index_) + ": " + err->message_);
+                }
+            });
             break;
         }
         case td_api::authorizationStateWaitPhoneNumber::ID: {
@@ -1811,67 +2514,97 @@ void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationStat
                 phone_env = session_config_;
             }
             if (!phone_env.empty()) {
-                if (phone_env[0] != '+') phone_env = "+" + phone_env;
                 LOGGER("AnnieXMedia.core.userbot").info("📲 جارٍ إرسال رقم هاتف المساعد " + std::to_string(index_) + " (" + phone_env + ") لطلب كود التفعيل...");
                 send_query(td_api::make_object<td_api::setAuthenticationPhoneNumber>(phone_env, nullptr),
-                           [this, phone_env](td_api::object_ptr<td_api::Object> obj) {
+                           [this](td_api::object_ptr<td_api::Object> obj) {
                                if (obj && obj->get_id() == td_api::error::ID) {
                                    auto* err = static_cast<const td_api::error*>(obj.get());
-                                   LOGGER("AnnieXMedia.core.userbot").error("❌ خطأ في رقم هاتف المساعد: " + err->message_);
-                                   app.send_message(config::LOGGER_ID,
-                                       "❌ <b>خطأ في رقم هاتف الحساب المساعد (" + phone_env + "):</b>\n<code>" + err->message_ + "</code>\n"
-                                       "أرسل الرقم الصحيح في شات البوت بالأمر:\n<code>رقم المساعد +201xxxxxxxxx</code>");
+                                   LOGGER("AnnieXMedia.core.userbot").error("❌ فشل إرسال رقم المساعد " + std::to_string(index_) + ": " + err->message_);
                                }
                            });
             } else {
                 LOGGER("AnnieXMedia.core.userbot").warning(
-                    "💝 المساعد " + std::to_string(index_) +
-                    ": أرسل رقم هاتف المساعد في شات البوت بالأمر: رقم المساعد +201xxxxxxxxx"
+                    "📲 المساعد " + std::to_string(index_) + " بانتظار رقم الهاتف! أرسل في خاص البوت: رقم المساعد +201xxxxxxxxx"
                 );
             }
             break;
         }
         case td_api::authorizationStateWaitCode::ID: {
-            waiting_code_.store(true);
-            waiting_password_.store(false);
-            LOGGER("AnnieXMedia.core.userbot").warning(
-                "📲 المساعد " + std::to_string(index_) + " بانتظار كود التفعيل! أرسل الكود الآن في جروب السجل أو في خاص البوت: كود المساعد 1 2 3 4 5"
-            );
-            std::thread([idx = index_]() {
-                std::string prompt_msg =
-                    "📲 <b>تم إرسال كود تسجيل الدخول للحساب المساعد (" + std::to_string(idx) + ") على تيليجرام!</b>\n\n"
-                    "⚠️ <b>تنبيه هام:</b> لا تضع الكود في السكرتس ولا تعمل Deploy (لأن عمل Deploy يعيد تشغيل الماشين ويلغي الكود الحالي).\n\n"
-                    "✍️ <b>فقط أرسل الكود الآن هنا في جروب السجل أو في خاص البوت</b> مفصولاً بمسافات هكذا:\n"
-                    "<code>كود المساعد 1 2 3 4 5</code>\n"
-                    "أو أرسل الأرقام مباشرة:\n"
-                    "<code>1 2 3 4 5</code>";
-                app.send_message(config::LOGGER_ID, prompt_msg);
-                if (config::OWNER_ID != 0 && config::OWNER_ID != config::LOGGER_ID) {
-                    app.send_message(config::OWNER_ID, prompt_msg);
-                }
-            }).detach();
+            std::string code_env = config::getenv_str(("ASSISTANT_CODE" + std::to_string(index_)).c_str(), "");
+            if (!code_env.empty()) {
+                send_query(td_api::make_object<td_api::checkAuthenticationCode>(code_env));
+            } else {
+                LOGGER("AnnieXMedia.core.userbot").warning(
+                    "📲 المساعد " + std::to_string(index_) + " بانتظار كود التفعيل! أرسل الكود الآن في جروب السجل أو في خاص البوت: كود المساعد 1 2 3 4 5"
+                );
+                app.send_message(
+                    config::OWNER_ID,
+                    "📲 <b>المساعد " + std::to_string(index_) + " بانتظار كود التفعيل!</b>\n"
+                    "أرسل الكود الآن هنا في الشات مفصولاً بمسافات هكذا:\n"
+                    "<code>كود المساعد 1 2 3 4 5</code>"
+                );
+            }
             break;
         }
         case td_api::authorizationStateWaitPassword::ID: {
-            auto* pw_state = static_cast<const td_api::authorizationStateWaitPassword*>(state.get());
-            {
-                std::lock_guard<std::mutex> lock(mtx_);
-                password_hint_ = pw_state ? pw_state->password_hint_ : "";
+            std::string pass_env = config::getenv_str(("ASSISTANT_PASSWORD" + std::to_string(index_)).c_str(), "");
+            if (!pass_env.empty()) {
+                send_query(td_api::make_object<td_api::checkAuthenticationPassword>(pass_env));
+            } else {
+                LOGGER("AnnieXMedia.core.userbot").warning(
+                    "🔐 المساعد " + std::to_string(index_) + " محمي بكلمة مرور التحقق بخطوتين (2FA)! بانتظار إدخال الباسورد في شات البوت..."
+                );
+                app.send_message(
+                    config::OWNER_ID,
+                    "🔐 <b>حساب المساعد " + std::to_string(index_) + " محمي بكلمة مرور التحقق بخطوتين (2FA)!</b>\n"
+                    "أرسل كلمة المرور الآن هنا في الشات هكذا:\n"
+                    "<code>باسورد المساعد كلمه_السر</code>"
+                );
             }
-            waiting_code_.store(false);
-            waiting_password_.store(true);
-            LOGGER("AnnieXMedia.core.userbot").warning(
-                "🔐 المساعد " + std::to_string(index_) + " محمي بكلمة مرور التحقق بخطوتين (2FA)! بانتظار إدخال الباسورد في شات البوت..."
-            );
             break;
         }
         case td_api::authorizationStateReady::ID: {
-            waiting_code_.store(false);
-            waiting_password_.store(false);
-            authorized_.store(true);
-            std::thread([this]() {
-                this->finalize_authorization();
-            }).detach();
+            bool was_ready = authorized_.exchange(true);
+            if (!was_ready) {
+                std::thread([this]() {
+                    auto me_obj = this->send_query_sync(td_api::make_object<td_api::getMe>(), 8);
+                    if (me_obj && me_obj->get_id() == td_api::user::ID) {
+                        auto me = td_api::move_object_as<td_api::user>(me_obj);
+                        this->id = me->id_;
+                        this->name = me->first_name_ + (me->last_name_.empty() ? "" : (" " + me->last_name_));
+                        if (me->usernames_ && !me->usernames_->active_usernames_.empty()) {
+                            this->username = me->usernames_->active_usernames_[0];
+                        }
+                        if (std::find(assistants.begin(), assistants.end(), index_) == assistants.end()) {
+                            assistants.push_back(index_);
+                        }
+                        if (std::find(assistantids.begin(), assistantids.end(), this->id) == assistantids.end()) {
+                            assistantids.push_back(this->id);
+                        }
+                        LOGGER("AnnieXMedia.core.userbot").info(
+                            "☔ تم تشغيل المساعد " + std::to_string(index_) + " بنجاح بهوية: " +
+                            this->name + " (@" + this->username + ") [ID: " + std::to_string(this->id) + "]"
+                        );
+
+                        this->send_query_sync(td_api::make_object<td_api::getChats>(nullptr, 100), 6);
+                        std::string start_text = "☔ تم بدء تشغيل الحساب المساعد " + std::to_string(index_) +
+                                                 " بنجاح بهوية: " + this->name + " (@" + this->username + ")";
+                        if (config::LOGGER_ID != 0) {
+                            this->send_message(config::LOGGER_ID, start_text);
+                        }
+                        if (config::OWNER_ID != 0) {
+                            this->send_message(config::OWNER_ID, start_text);
+                            app.send_message(
+                                config::OWNER_ID,
+                                "✅ <b>تم تشغيل الحساب المساعد " + std::to_string(index_) + " بنجاح!</b>\n"
+                                "• الاسم: " + this->name + "\n"
+                                "• اليوزر: @" + this->username + "\n"
+                                "• الآيدي: <code>" + std::to_string(this->id) + "</code>"
+                            );
+                        }
+                    }
+                }).detach();
+            }
             break;
         }
         default:
@@ -1918,13 +2651,12 @@ bool AssistantClient::start() {
         }
     });
 
-    for (int i = 0; i < 60 && !authorized_.load(); ++i) {
+    for (int i = 0; i < 50 && !authorized_.load(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    if (authorized_.load()) {
-        finalize_authorization();
-    } else {
+    if (!authorized_.load()) {
+        assistants.push_back(index_);
         LOGGER("AnnieXMedia.core.userbot").info(
             "⏳ المساعد " + std::to_string(index_) + " ينتظر إدخال كود التفعيل من تيليجرام (أرسل الكود في شات البوت أو جروب السجل بدون عمل Deploy)..."
         );
@@ -1939,7 +2671,19 @@ void AssistantClient::stop() {
 }
 
 int32_t AssistantClient::get_or_create_group_call_id(int64_t chat_id, bool auto_create) {
-    auto chat_obj = send_query_sync(td_api::make_object<td_api::getChat>(chat_id), 8);
+    auto chat_obj = send_query_sync(td_api::make_object<td_api::getChat>(chat_id), 6);
+    if (!chat_obj || chat_obj->get_id() == td_api::error::ID) {
+        send_query_sync(td_api::make_object<td_api::getChats>(nullptr, 100), 5);
+        chat_obj = send_query_sync(td_api::make_object<td_api::getChat>(chat_id), 6);
+    }
+    if (!chat_obj || chat_obj->get_id() != td_api::chat::ID) {
+        std::string inv = app.export_chat_invite_link(chat_id);
+        if (!inv.empty()) {
+            LOGGER("AnnieXMedia.core.userbot").info("🔗 Assistant joining chat " + std::to_string(chat_id) + " via invite link...");
+            join_chat_by_link_or_username(inv);
+            chat_obj = send_query_sync(td_api::make_object<td_api::getChat>(chat_id), 6);
+        }
+    }
     if (chat_obj && chat_obj->get_id() == td_api::chat::ID) {
         auto* c = static_cast<const td_api::chat*>(chat_obj.get());
         if (c->video_chat_ && c->video_chat_->group_call_id_ != 0) {
@@ -1947,7 +2691,11 @@ int32_t AssistantClient::get_or_create_group_call_id(int64_t chat_id, bool auto_
             chat_group_call_ids_[chat_id] = c->video_chat_->group_call_id_;
             return c->video_chat_->group_call_id_;
         }
+    } else if (chat_obj && chat_obj->get_id() == td_api::error::ID) {
+        auto* err = static_cast<const td_api::error*>(chat_obj.get());
+        LOGGER("AnnieXMedia.core.userbot").error("❌ Assistant getChat(" + std::to_string(chat_id) + ") failed: " + err->message_);
     }
+
     if (auto_create) {
         auto created = send_query_sync(td_api::make_object<td_api::createVideoChat>(chat_id, config::BOT_NAME, 0, false), 8);
         if (created && created->get_id() == td_api::groupCallId::ID) {
@@ -1955,6 +2703,10 @@ int32_t AssistantClient::get_or_create_group_call_id(int64_t chat_id, bool auto_
             std::lock_guard<std::mutex> lock(mtx_);
             chat_group_call_ids_[chat_id] = gcid;
             return gcid;
+        }
+        if (created && created->get_id() == td_api::error::ID) {
+            auto* err = static_cast<const td_api::error*>(created.get());
+            LOGGER("AnnieXMedia.core.userbot").error("❌ Assistant createVideoChat(" + std::to_string(chat_id) + ") failed: " + err->message_);
         }
     }
     return 0;
@@ -1964,7 +2716,7 @@ std::string AssistantClient::join_group_call_signaling(int64_t chat_id, const st
                                                        int32_t audio_source_ssrc, bool is_muted, bool is_video_enabled) {
     int32_t group_call_id = get_or_create_group_call_id(chat_id, true);
     if (group_call_id == 0) {
-        throw std::runtime_error("Group call not found or could not be initialized");
+        throw std::runtime_error("لم يتم العثور على مكالمة صوتية مفتوحة في المجموعة (تأكد من فتح المكالمة ووجود المساعد في المجموعة).");
     }
 
     auto join_params = td_api::make_object<td_api::groupCallJoinParameters>(
@@ -1986,12 +2738,15 @@ std::string AssistantClient::join_group_call_signaling(int64_t chat_id, const st
         ""
     );
 
-    auto resp = send_query_sync(std::move(req), 10);
+    auto resp = send_query_sync(std::move(req), 12);
     if (resp && resp->get_id() == td_api::text::ID) {
-        return static_cast<const td_api::text*>(resp.get())->text_;
+        std::string transport = static_cast<const td_api::text*>(resp.get())->text_;
+        LOGGER("AnnieXMedia.core.userbot").info("✅ TDLib joinVideoChat succeeded (" + std::to_string(transport.size()) + " bytes transport).");
+        return transport;
     }
     if (resp && resp->get_id() == td_api::error::ID) {
         auto* err = static_cast<const td_api::error*>(resp.get());
+        LOGGER("AnnieXMedia.core.userbot").error("❌ TDLib joinVideoChat error: [" + std::to_string(err->code_) + "] " + err->message_);
         throw std::runtime_error("TDLib joinVideoChat error: " + err->message_);
     }
     throw std::runtime_error("Failed to receive transport payload from joinVideoChat");
@@ -2067,12 +2822,7 @@ bool AssistantClient::leave_chat(int64_t chat_id) {
 
 void AssistantClient::send_message(int64_t chat_id, const std::string& text) {
     if (chat_id > 0) {
-        send_query(td_api::make_object<td_api::createPrivateChat>(chat_id, true));
-    } else if (chat_id < -1000000000000LL) {
-        int64_t sg_id = (-chat_id) - 1000000000000LL;
-        send_query(td_api::make_object<td_api::createSupergroupChat>(sg_id, true));
-    } else if (chat_id < 0) {
-        send_query(td_api::make_object<td_api::createBasicGroupChat>(-chat_id, true));
+        send_query_sync(td_api::make_object<td_api::createPrivateChat>(chat_id, false), 3);
     }
     auto req = td_api::make_object<td_api::sendMessage>();
     req->chat_id_ = chat_id;
@@ -2081,14 +2831,17 @@ void AssistantClient::send_message(int64_t chat_id, const std::string& text) {
     ft->text_ = text;
     content->text_ = std::move(ft);
     req->input_message_content_ = std::move(content);
-    send_query(std::move(req));
+    send_query(std::move(req), [chat_id](td_api::object_ptr<td_api::Object> obj) {
+        if (obj && obj->get_id() == td_api::error::ID) {
+            auto* err = static_cast<const td_api::error*>(obj.get());
+            LOGGER("AnnieXMedia.core.userbot").warning("⚠️ Assistant send_message(" + std::to_string(chat_id) + ") warning: " + err->message_);
+        }
+    });
 }
 
 Userbot::Userbot() = default;
 
 void Userbot::start() {
-    if (std::system("python3 /usr/local/bin/td_session_sync.py restore >/dev/null 2>&1") != 0) {}
-
     LOGGER("AnnieXMedia.core.userbot").info("💝 جارٍ بدء تشغيل حسابات المساعدين (TDLib Native)...");
     if (!config::STRING1.empty()) {
         one = std::make_shared<AssistantClient>(1, config::STRING1);
@@ -2136,434 +2889,9 @@ std::shared_ptr<AssistantClient> Userbot::get_by_index(int index) const {
 EOF
 
 # ------------------------------------------------------------------
-# 6. تحديث AnnieXMedia/main.cpp لدعم إدخال الكود والباسورد تفاعلياً في شات البوت مع فحص الأخطاء
+# 4. ترجمة وبناء البوت النهائي (annie_music_bot)
 # ------------------------------------------------------------------
-cat << 'EOF' > AnnieXMedia/main.cpp
-// ── 𝚂ᴏᴜʀᴄᴇ ✘ 𝐁ᴏᴅᴀ © 2026 (C++20 Edition - TDLib & Native NTgCalls) ──────────
-#include "config.hpp"
-#include "strings/strings.hpp"
-#include "AnnieXMedia/logging.hpp"
-#include "AnnieXMedia/misc.hpp"
-#include "AnnieXMedia/core/bot.hpp"
-#include "AnnieXMedia/core/call.hpp"
-#include "AnnieXMedia/core/dir.hpp"
-#include "AnnieXMedia/core/git.hpp"
-#include "AnnieXMedia/core/mongo.hpp"
-#include "AnnieXMedia/core/userbot.hpp"
-#include "AnnieXMedia/plugins/plugin_manager.hpp"
-#include "AnnieXMedia/utils/cookie_handler.hpp"
-#include "AnnieXMedia/utils/database.hpp"
-
-#include <algorithm>
-#include <csignal>
-#include <cstdlib>
-#include <cstring>
-#include <iostream>
-#include <thread>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-using namespace AnnieXMedia;
-
-static void start_healthcheck_server() {
-    std::thread([]() {
-        int port = static_cast<int>(config::getenv_int("PORT", 8080));
-        int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (server_fd < 0) return;
-        int opt = 1;
-        ::setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(static_cast<uint16_t>(port));
-        if (::bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-            ::close(server_fd);
-            return;
-        }
-        ::listen(server_fd, 8);
-        const char* resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
-        while (true) {
-            int client_fd = ::accept(server_fd, nullptr, nullptr);
-            if (client_fd < 0) continue;
-            char buf[256];
-            (void)::read(client_fd, buf, sizeof(buf));
-            (void)::write(client_fd, resp, std::strlen(resp));
-            ::close(client_fd);
-        }
-    }).detach();
-}
-
-static std::string normalize_arabic_digits(std::string s) {
-    for (int i = 0; i < 10; ++i) {
-        std::string ar = "\xD9" + std::string(1, static_cast<char>(0xA0 + i));
-        std::string fa = "\xDB" + std::string(1, static_cast<char>(0xB0 + i));
-        std::string en(1, static_cast<char>('0' + i));
-        size_t pos = 0;
-        while ((pos = s.find(ar, pos)) != std::string::npos) s.replace(pos, ar.size(), en);
-        pos = 0;
-        while ((pos = s.find(fa, pos)) != std::string::npos) s.replace(pos, fa.size(), en);
-    }
-    return s;
-}
-
-static void register_assistant_login_commands() {
-    core::app.on_message([](const core::IncomingMessage& msg) -> bool {
-        bool is_authorized_user = (msg.sender_user_id == config::OWNER_ID ||
-                                   SUDOERS.count(msg.sender_user_id) > 0 ||
-                                   msg.chat_id == config::LOGGER_ID);
-        if (!is_authorized_user) return false;
-
-        std::string t = normalize_arabic_digits(msg.text);
-        while (!t.empty() && (t.front() == ' ' || t.front() == '\t' || t.front() == '\r' || t.front() == '\n')) t.erase(t.begin());
-        while (!t.empty() && (t.back() == ' ' || t.back() == '\t' || t.back() == '\r' || t.back() == '\n')) t.pop_back();
-        if (t.empty()) return false;
-
-        auto extract_arg = [](const std::string& s, const std::string& prefix) -> std::string {
-            if (s.rfind(prefix, 0) != 0) return "";
-            std::string rest = s.substr(prefix.size());
-            while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) rest.erase(rest.begin());
-            while (!rest.empty() && (rest.back() == ' ' || rest.back() == '\t' || rest.back() == '\r' || rest.back() == '\n')) rest.pop_back();
-            return rest;
-        };
-
-        // 1. أمر إدخال أو تغيير رقم الهاتف
-        std::string phone = extract_arg(t, "/assphone");
-        if (phone.empty()) phone = extract_arg(t, "رقم المساعد");
-        if (!phone.empty()) {
-            if (phone[0] != '+') phone = "+" + phone;
-            if (!core::userbot.one) {
-                core::userbot.one = std::make_shared<core::AssistantClient>(1, phone);
-                core::userbot.one->start();
-            }
-            auto r = core::userbot.one->send_query_sync(
-                core::td_api::make_object<core::td_api::setAuthenticationPhoneNumber>(phone, nullptr), 10
-            );
-            if (r && r->get_id() == core::td_api::error::ID) {
-                auto* err = static_cast<const core::td_api::error*>(r.get());
-                core::app.send_message(
-                    msg.chat_id,
-                    "❌ <b>الرقم غير صحيح أو مرفوض من تيليجرام:</b>\n<code>" + err->message_ + "</code>\n\n"
-                    "تأكد من كتابة الرقم بالصيغة الدولية مع مفتاح الدولة (مثال: <code>رقم المساعد +2010xxxxxxxx</code>).",
-                    {}, msg.id
-                );
-            } else {
-                core::app.send_message(
-                    msg.chat_id,
-                    "📲 <b>تم إرسال كود التفعيل إلى رقم المساعد (" + phone + ") على تيليجرام!</b>\n\n"
-                    "✍️ أرسل الكود الآن هنا في الشات مفصولاً بمسافات (مثال: <code>1 2 3 4 5</code> أو <code>كود المساعد 1 2 3 4 5</code>):",
-                    {}, msg.id
-                );
-            }
-            return true;
-        }
-
-        // 2. أمر إدخال كود التفعيل (أو إرسال الأرقام مباشرة عندما يكون المساعد بانتظار الكود)
-        std::string code = extract_arg(t, "/asscode");
-        if (code.empty()) code = extract_arg(t, "كود المساعد");
-        if (code.empty() && core::userbot.one && core::userbot.one->is_waiting_code()) {
-            bool looks_like_code = std::all_of(t.begin(), t.end(), [](unsigned char c) {
-                return std::isdigit(c) || c == ' ' || c == '-';
-            });
-            if (looks_like_code) {
-                std::string d;
-                for (char c : t) if (std::isdigit(static_cast<unsigned char>(c))) d.push_back(c);
-                if (d.size() >= 4 && d.size() <= 6) {
-                    code = d;
-                }
-            }
-        }
-
-        if (!code.empty()) {
-            std::string digits_only;
-            for (char c : code) {
-                if (std::isdigit(static_cast<unsigned char>(c))) digits_only.push_back(c);
-            }
-            if (!core::userbot.one) {
-                core::app.send_message(msg.chat_id, "⚠️ أرسل رقم الهاتف أولاً بالأمر:\n<code>رقم المساعد +201xxxxxxxxx</code>", {}, msg.id);
-                return true;
-            }
-            if (digits_only.size() < 4 || digits_only.size() > 6) {
-                core::app.send_message(
-                    msg.chat_id,
-                    "❌ <b>صيغة الكود غير صحيحة!</b>\n"
-                    "كود تيليجرام يتكون من 5 أرقام. أرسله مفصولاً بمسافات هكذا:\n"
-                    "<code>كود المساعد 1 2 3 4 5</code>",
-                    {}, msg.id
-                );
-                return true;
-            }
-
-            auto r = core::userbot.one->send_query_sync(
-                core::td_api::make_object<core::td_api::checkAuthenticationCode>(digits_only), 10
-            );
-            if (r && r->get_id() == core::td_api::error::ID) {
-                auto* err = static_cast<const core::td_api::error*>(r.get());
-                std::string err_msg = err->message_;
-                if (err_msg.find("PHONE_CODE_INVALID") != std::string::npos) {
-                    core::app.send_message(
-                        msg.chat_id,
-                        "❌ <b>الكود الذي أدخلته غلط (غير صحيح)!</b>\n\n"
-                        "تأكد من الأرقام التي وصلتك في رسالة تيليجرام وأرسل الكود الصحيح مرة أخرى هكذا:\n"
-                        "<code>كود المساعد 1 2 3 4 5</code>",
-                        {}, msg.id
-                    );
-                } else if (err_msg.find("PHONE_CODE_EXPIRED") != std::string::npos) {
-                    core::userbot.one->send_query(core::td_api::make_object<core::td_api::resendAuthenticationCode>(nullptr));
-                    core::app.send_message(
-                        msg.chat_id,
-                        "⚠️ <b>انتهت صلاحية هذا الكود!</b>\n\n"
-                        "تم طلب إرسال كود جديد تلقائياً، أو يمكنك طلب كود جديد بإرسال:\n"
-                        "<code>رقم المساعد +201xxxxxxxxx</code>",
-                        {}, msg.id
-                    );
-                } else {
-                    core::app.send_message(
-                        msg.chat_id,
-                        "❌ <b>خطأ أثناء التحقق من الكود:</b>\n<code>" + err_msg + "</code>\n"
-                        "حاول إرسال الكود الصحيح مرة أخرى.",
-                        {}, msg.id
-                    );
-                }
-                return true;
-            }
-
-            // الكود صحيح! ننتظر لحظة لنرى هل الحساب عليه باسورد تحقق بخطوتين (2FA) أم دخل مباشرة
-            for (int i = 0; i < 25; ++i) {
-                if (core::userbot.one->is_authorized() || core::userbot.one->is_waiting_password()) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-
-            if (core::userbot.one->is_waiting_password()) {
-                std::string hint = core::userbot.one->get_password_hint();
-                std::string hint_line = hint.empty() ? "" : ("\n• <b>تلميح الباسورد :</b> <code>" + hint + "</code>\n");
-                core::app.send_message(
-                    msg.chat_id,
-                    "✅ <b>الكود صحيح!</b>\n"
-                    "🔐 <b>هذا الحساب محمي بكلمة مرور التحقق بخطوتين (2FA).</b>" + hint_line + "\n"
-                    "✍️ <b>أرسل الباسورد الآن هنا في الشات مباشرة</b> أو بهذا الأمر:\n"
-                    "<code>باسورد المساعد كلمه_السر</code>",
-                    {}, msg.id
-                );
-            } else {
-                core::userbot.one->finalize_authorization();
-                core::app.send_message(
-                    msg.chat_id,
-                    "✅ <b>الكود صحيح! الحساب ليس عليه باسورد، وتم تسجيل الدخول وتشغيل الحساب المساعد بنجاح 🤍</b>\n\n"
-                    "• <b>الاسم :</b> " + core::userbot.one->name + "\n"
-                    "• <b>الآيدي :</b> <code>" + std::to_string(core::userbot.one->id) + "</code>\n"
-                    "• <b>اليوزر :</b> @" + core::userbot.one->username,
-                    {}, msg.id
-                );
-            }
-            return true;
-        }
-
-        // 3. أمر إدخال باسورد التحقق بخطوتين (أو إرسال الباسورد مباشرة في خاص البوت عندما يكون المساعد بانتظار الباسورد)
-        std::string pass = extract_arg(msg.text, "/asspass");
-        if (pass.empty()) pass = extract_arg(msg.text, "باسورد المساعد");
-        if (pass.empty() && core::userbot.one && core::userbot.one->is_waiting_password() && msg.is_private && t[0] != '/') {
-            pass = msg.text;
-            while (!pass.empty() && (pass.front() == ' ' || pass.front() == '\t')) pass.erase(pass.begin());
-            while (!pass.empty() && (pass.back() == ' ' || pass.back() == '\t' || pass.back() == '\r' || pass.back() == '\n')) pass.pop_back();
-        }
-
-        if (!pass.empty()) {
-            if (!core::userbot.one) {
-                core::app.send_message(msg.chat_id, "⚠️ أرسل رقم الهاتف والكود أولاً.", {}, msg.id);
-                return true;
-            }
-            auto r = core::userbot.one->send_query_sync(
-                core::td_api::make_object<core::td_api::checkAuthenticationPassword>(pass), 10
-            );
-            if (r && r->get_id() == core::td_api::error::ID) {
-                auto* err = static_cast<const core::td_api::error*>(r.get());
-                std::string hint = core::userbot.one->get_password_hint();
-                std::string hint_line = hint.empty() ? "" : ("\n• <b>تلميح الباسورد :</b> <code>" + hint + "</code>");
-                core::app.send_message(
-                    msg.chat_id,
-                    "❌ <b>الباسورد الذي أدخلته غلط (غير صحيح)!</b>\n"
-                    "<code>" + err->message_ + "</code>" + hint_line + "\n\n"
-                    "تأكد من كلمة مرور التحقق بخطوتين وأرسلها مرة أخرى هكذا:\n"
-                    "<code>باسورد المساعد كلمه_السر</code>",
-                    {}, msg.id
-                );
-                return true;
-            }
-
-            for (int i = 0; i < 25 && !core::userbot.one->is_authorized(); ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            core::userbot.one->finalize_authorization();
-            core::app.send_message(
-                msg.chat_id,
-                "✅ <b>الباسورد صحيح! تم تسجيل الدخول وتشغيل الحساب المساعد بنجاح 🤍</b>\n\n"
-                "• <b>الاسم :</b> " + core::userbot.one->name + "\n"
-                "• <b>الآيدي :</b> <code>" + std::to_string(core::userbot.one->id) + "</code>\n"
-                "• <b>اليوزر :</b> @" + core::userbot.one->username,
-                {}, msg.id
-            );
-            return true;
-        }
-
-        return false;
-    });
-}
-
-static void signal_handler(int signum) {
-    (void)signum;
-    LOGGER("AnnieXMedia").info("🛑 Bot process killed by user (SIGINT/SIGTERM). Stopping services...");
-    core::app.stop();
-    core::userbot.stop();
-    std::exit(0);
-}
-
-int main() {
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
-
-    // تشغيل خادم الفحص الصحي على المنفذ 8080 ليتوافق مع Fly.io Proxy
-    start_healthcheck_server();
-
-    if (config::getenv_str("DEBUG_NTG", "0") == "1") {
-        std::cout << "🚨 تم تفعيل وضع الـ DEBUG لمكتبة ntgcalls C++ بناءً على طلبك من الكونسول 🚨" << std::endl;
-    }
-
-    // 1. Load configuration (.env) and language strings
-    config::init_config();
-    strings::init_strings("strings/langs");
-
-    // 2. Initialize directories, git, MongoDB, in-memory DB, and Heroku checks
-    core::StorageManager();
-    core::git();
-    core::init_mongo();
-    dbb();
-    heroku();
-
-    LOGGER("AnnieXMedia").info("🚀 Starting Annie Music Bot (C++20 Native TDLib & NTgCalls Engine)...");
-
-    // 3. Load YouTube cookies if COOKIE_URL is provided
-    try {
-        utils::fetch_and_store_cookies();
-    } catch (const std::exception& e) {
-        LOGGER("AnnieXMedia").warning(std::string("⚠️ Cookie Error: ") + e.what());
-    }
-
-    // 4. Load sudoers and banned/gbanned users
-    sudo();
-    for (auto uid : utils::database::get_gbanned()) {
-        config::BANNED_USERS.insert(uid);
-    }
-    for (auto uid : utils::database::get_banned_users()) {
-        config::BANNED_USERS.insert(uid);
-    }
-
-    // 5. Start TDLib Bot Client & register all C++ plugins + interactive Assistant login commands
-    core::app.start();
-    register_assistant_login_commands();
-    plugins::register_all_plugins();
-
-    // 6. Start TDLib Assistant Userbots & Native C++ NTgCalls StreamController
-    core::userbot.start();
-    core::StreamController.start();
-    core::StreamController.decorators();
-
-    LOGGER("AnnieXMedia").info("✅ Annie Music Bot (C++20) Started Successfully.");
-
-    // 7. Block until interrupted
-    core::app.idle();
-
-    core::app.stop();
-    core::userbot.stop();
-    LOGGER("AnnieXMedia").info("🛑 Stopping Annie Music Bot...");
-    return 0;
-}
-EOF
-
-cat << 'EOF' > CMakeLists.txt
-cmake_minimum_required(VERSION 3.22)
-project(AnnieXBodaCPP VERSION 3.0.0 LANGUAGES C CXX)
-
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
-find_package(Threads REQUIRED)
-find_package(OpenSSL REQUIRED)
-find_package(ZLIB REQUIRED)
-find_package(Td REQUIRED PATHS "/usr/local/lib/cmake/Td")
-
-include_directories(
-    "${CMAKE_SOURCE_DIR}"
-    "${CMAKE_SOURCE_DIR}/deps/ntgcalls/include"
-    "/usr/local/include"
-)
-
-link_directories(
-    "${CMAKE_SOURCE_DIR}/deps/ntgcalls/lib"
-    "/usr/local/lib"
-)
-
-set(BOT_SOURCES
-    config.cpp
-    strings/strings.cpp
-    AnnieXMedia/misc.cpp
-    AnnieXMedia/core/dir.cpp
-    AnnieXMedia/core/git.cpp
-    AnnieXMedia/core/mongo.cpp
-    AnnieXMedia/core/bot.cpp
-    AnnieXMedia/core/userbot.cpp
-    AnnieXMedia/core/call.cpp
-    AnnieXMedia/mongo/couples_db.cpp
-    AnnieXMedia/mongo/pretenderdb.cpp
-    AnnieXMedia/mongo/welcomedb.cpp
-    AnnieXMedia/utils/formatters.cpp
-    AnnieXMedia/utils/database.cpp
-    AnnieXMedia/utils/cookie_handler.cpp
-    AnnieXMedia/utils/thumbnails.cpp
-    AnnieXMedia/utils/inline.cpp
-    AnnieXMedia/utils/stream/autoclear.cpp
-    AnnieXMedia/utils/stream/queue.cpp
-    AnnieXMedia/utils/stream/stream.cpp
-    AnnieXMedia/platforms/Youtube.cpp
-    AnnieXMedia/platforms/SongDownloader.cpp
-    AnnieXMedia/platforms/Spotify.cpp
-    AnnieXMedia/platforms/Soundcloud.cpp
-    AnnieXMedia/platforms/Apple.cpp
-    AnnieXMedia/platforms/Resso.cpp
-    AnnieXMedia/platforms/Carbon.cpp
-    AnnieXMedia/platforms/Telegram.cpp
-    AnnieXMedia/plugins/plugin_manager.cpp
-    AnnieXMedia/plugins/play/play_plugins.cpp
-    AnnieXMedia/plugins/admins/admin_plugins.cpp
-    AnnieXMedia/plugins/bot/bot_plugins.cpp
-    AnnieXMedia/plugins/sudo/sudo_plugins.cpp
-    AnnieXMedia/plugins/AzanSystem/azan_system.cpp
-    AnnieXMedia/plugins/security/security.cpp
-    AnnieXMedia/plugins/ai/ai.cpp
-    AnnieXMedia/plugins/Manager/manager_plugins.cpp
-    AnnieXMedia/plugins/tools/tools_misc_kishu.cpp
-    AnnieXMedia/main.cpp
-)
-
-add_executable(annie_music_bot ${BOT_SOURCES})
-
-target_link_libraries(annie_music_bot PRIVATE
-    ntgcalls-native
-    wrtc
-    Td::TdStatic
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    ZLIB::ZLIB
-    Threads::Threads
-    dl
-)
-EOF
-
-# ------------------------------------------------------------------
-# 7. ترجمة وبناء البوت النهائي (annie_music_bot)
-# ------------------------------------------------------------------
-echo "⚙️ [3/3] Compiling AnnieXBoda C++20 Bot executable..."
+echo "⚙️ [4/4] Compiling AnnieXBoda C++20 Bot executable..."
 rm -rf build
 mkdir -p build
 cd build
