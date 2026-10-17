@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <regex>
+#include <thread>
 #include <unordered_map>
 
 namespace AnnieXMedia::core {
@@ -18,9 +19,16 @@ static std::unordered_map<int64_t, std::pair<std::string, std::string>> g_chat_c
 static std::unordered_map<int64_t, int64_t> g_msg_id_map;
 
 static int64_t resolve_message_id(int64_t msg_id) {
-    std::lock_guard<std::mutex> lk(g_cache_mtx);
-    auto it = g_msg_id_map.find(msg_id);
-    if (it != g_msg_id_map.end()) return it->second;
+    if (msg_id == 0) return 0;
+    for (int i = 0; i < 12; ++i) {
+        {
+            std::lock_guard<std::mutex> lk(g_cache_mtx);
+            auto it = g_msg_id_map.find(msg_id);
+            if (it != g_msg_id_map.end()) return it->second;
+        }
+        if ((msg_id & 0xFFFFF) == 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     return msg_id;
 }
 
@@ -41,7 +49,7 @@ static std::string ensure_local_image(const std::string& path_or_url) {
         if (std::filesystem::exists(local_file) && std::filesystem::file_size(local_file) > 512) {
             return local_file;
         }
-        std::string cmd = "curl -sL --max-time 8 -A \"Mozilla/5.0\" \"" + path_or_url + "\" -o \"" + local_file + "\"";
+        std::string cmd = "curl -4 -sL --max-time 8 -A \"Mozilla/5.0\" \"" + path_or_url + "\" -o \"" + local_file + "\"";
         (void)std::system(cmd.c_str());
         if (std::filesystem::exists(local_file) && std::filesystem::file_size(local_file) > 512) {
             return local_file;
@@ -51,7 +59,7 @@ static std::string ensure_local_image(const std::string& path_or_url) {
 }
 
 MusicBotClient::MusicBotClient() {
-    td::ClientManager::execute(td_api::make_object<td_api::setLogVerbosityLevel>(1));
+    td::ClientManager::execute(td_api::make_object<td_api::setLogVerbosityLevel>(0));
     client_manager_ = std::make_unique<td::ClientManager>();
     client_id_ = client_manager_->create_client_id();
     LOGGER("AnnieXMedia.core.bot").info("Bot client initialized with native C++ TDLib engine.");
@@ -397,13 +405,16 @@ void MusicBotClient::start() {
         this->username = config::BOT_USERNAME;
     }
 
-    send_message(
-        config::LOGGER_ID,
-        "<u><b>» " + this->mention + " ʙᴏᴛ sᴛᴀʀᴛᴇᴅ (C++ TDLib & Native NTgCalls) :</b></u>\n\n"
-        "ɪᴅ : <code>" + std::to_string(this->id) + "</code>\n"
-        "ɴᴀᴍᴇ : " + this->name + "\n"
-        "ᴜsᴇʀɴᴀᴍᴇ : @" + this->username
-    );
+    if (config::LOGGER_ID != 0) {
+        (void)send_query_sync(td_api::make_object<td_api::getChat>(config::LOGGER_ID), 3);
+        send_message(
+            config::LOGGER_ID,
+            "<u><b>» " + this->mention + " ʙᴏᴛ sᴛᴀʀᴛᴇᴅ (C++ TDLib & Native NTgCalls) :</b></u>\n\n"
+            "ɪᴅ : <code>" + std::to_string(this->id) + "</code>\n"
+            "ɴᴀᴍᴇ : " + this->name + "\n"
+            "ᴜsᴇʀɴᴀᴍᴇ : @" + this->username
+        );
+    }
 
     LOGGER("AnnieXMedia.core.bot").info("✅ Music Bot started as " + this->name + " (@" + this->username + ")");
 }
@@ -666,10 +677,6 @@ int64_t MusicBotClient::send_dice(int64_t chat_id, const std::string& emoji, int
 void MusicBotClient::edit_message_text(int64_t chat_id, int64_t message_id, const std::string& text,
                                        const InlineKeyboardMarkup& reply_markup) {
     int64_t real_id = resolve_message_id(message_id);
-    if (real_id == message_id) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        real_id = resolve_message_id(message_id);
-    }
     auto req = td_api::make_object<td_api::editMessageText>();
     req->chat_id_ = chat_id;
     req->message_id_ = real_id;
@@ -677,7 +684,11 @@ void MusicBotClient::edit_message_text(int64_t chat_id, int64_t message_id, cons
     auto content = td_api::make_object<td_api::inputMessageText>();
     content->text_ = parse_html_text(text);
     req->input_message_content_ = std::move(content);
-    send_query(std::move(req));
+    send_query(std::move(req), [this, chat_id, text, reply_markup](td_api::object_ptr<td_api::Object> obj) {
+        if (obj && obj->get_id() == td_api::error::ID) {
+            this->send_message(chat_id, text, reply_markup);
+        }
+    });
 }
 
 void MusicBotClient::edit_message_caption(int64_t chat_id, int64_t message_id, const std::string& caption,
@@ -693,10 +704,6 @@ void MusicBotClient::edit_message_caption(int64_t chat_id, int64_t message_id, c
 
 void MusicBotClient::delete_message(int64_t chat_id, int64_t message_id) {
     int64_t real_id = resolve_message_id(message_id);
-    if (real_id == message_id) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        real_id = resolve_message_id(message_id);
-    }
     delete_messages(chat_id, {real_id, message_id});
 }
 
