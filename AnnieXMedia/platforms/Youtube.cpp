@@ -29,6 +29,8 @@ constexpr int64_t CACHE_TTL_SEC = 3600;
 std::mutex g_yt_cache_mtx;
 std::unordered_map<std::string, std::pair<std::string, int64_t>> g_url_cache;
 std::unordered_map<std::string, std::pair<TrackDetails, int64_t>> g_meta_cache;
+std::string g_visitor_data;
+int64_t g_visitor_data_exp = 0;
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -318,6 +320,52 @@ std::string json_escape(const std::string& s) {
     return out;
 }
 
+std::string get_or_fetch_visitor_data() {
+    int64_t now = now_epoch();
+    {
+        std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
+        if (!g_visitor_data.empty() && g_visitor_data_exp > now) {
+            return g_visitor_data;
+        }
+    }
+    std::string payload =
+        "{\"context\":{\"client\":{"
+        "\"clientName\":\"WEB\","
+        "\"clientVersion\":\"2.20260708.00.00\","
+        "\"hl\":\"en\","
+        "\"gl\":\"US\""
+        "}}}";
+    std::string cmd =
+        "curl -4 -sS --max-time 4 --connect-timeout 2 "
+        "-X POST 'https://www.youtube.com/youtubei/v1/guide?prettyPrint=false' "
+        "-H 'Content-Type: application/json' "
+        "-H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15' "
+        "--data-raw " + shell_quote(payload) + " 2>/dev/null";
+    auto [out, rc] = core::run_shell_command(cmd);
+    if (rc == 0 && !out.empty()) {
+        JsonVal root = JsonParser(out).parse_value();
+        std::string vd = root.get("responseContext").get("visitorData").as_str();
+        if (!vd.empty()) {
+            std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
+            g_visitor_data = vd;
+            g_visitor_data_exp = now + 7200;
+            return vd;
+        }
+    }
+    return "";
+}
+
+struct ClientSpec {
+    const char* name;
+    const char* version;
+    const char* id;
+    const char* ua;
+    const char* extra_json;
+};
+
+// ---------------------------------------------------------------------------
+// 1. innertube_player: استخراج الرابط المباشر عبر عميل VISIONOS و IOS كما في yt-dlp-master
+// ---------------------------------------------------------------------------
 std::optional<TrackDetails> innertube_player(const std::string& vid, const std::string& base_url) {
     if (!is_valid_vidid(vid)) return std::nullopt;
     int64_t now = now_epoch();
@@ -326,93 +374,157 @@ std::optional<TrackDetails> innertube_player(const std::string& vid, const std::
         auto it = g_meta_cache.find(vid);
         if (it != g_meta_cache.end() && it->second.second > now) {
             auto a_it = g_url_cache.find(vid + ":a");
-            if (a_it != g_url_cache.end() && a_it->second.second > now) {
+            if (a_it != g_url_cache.end() && a_it->second.second > now && !a_it->second.first.empty()) {
                 return it->second.first;
             }
         }
     }
 
-    std::string payload =
-        "{\"context\":{\"client\":{"
-        "\"clientName\":\"VISIONOS\","
-        "\"clientVersion\":\"1.02\","
-        "\"deviceMake\":\"Apple\","
-        "\"deviceModel\":\"RealityDevice17,1\","
-        "\"osName\":\"visionOS\","
-        "\"osVersion\":\"26.5.23O471\","
-        "\"hl\":\"en\","
-        "\"timeZone\":\"UTC\","
-        "\"utcOffsetMinutes\":0"
-        "}},\"videoId\":\"" + json_escape(vid) + "\","
-        "\"contentCheckOk\":true,\"racyCheckOk\":true}";
+    std::string visitor_data = get_or_fetch_visitor_data();
 
-    std::string cmd =
-        "curl -4 -sS --max-time 4 --connect-timeout 2 "
-        "-X POST 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false' "
-        "-H 'Content-Type: application/json' "
-        "-H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15' "
-        "-H 'X-YouTube-Client-Name: 101' "
-        "-H 'X-YouTube-Client-Version: 1.02' "
-        "-H 'Origin: https://www.youtube.com' "
-        "--data-raw " + shell_quote(payload) + " 2>/dev/null";
-
-    auto [out, rc] = core::run_shell_command(cmd);
-    if (rc != 0 || out.empty()) return std::nullopt;
-
-    JsonVal root = JsonParser(out).parse_value();
-    const JsonVal& vd = root.get("videoDetails");
-    std::string title = vd.get("title").as_str();
-    if (title.empty()) return std::nullopt;
-
-    std::string v_id = vd.get("videoId").as_str(vid);
-    int secs = static_cast<int>(vd.get("lengthSeconds").as_int(0));
-    bool is_live = vd.get("isLive").as_bool(false) || (vd.get("isLiveContent").as_bool(false) && secs == 0);
-    std::string duration_min = is_live ? "Live" : sec_to_min_str(secs);
-
-    const JsonVal& sd = root.get("streamingData");
-    std::string cached_audio_url;
-    std::string cached_video_url;
-
-    auto scan_formats = [&](const JsonVal& arr_val) {
-        if (arr_val.type != JsonVal::Array) return;
-        for (const auto& fmt : arr_val.arr) {
-            std::string f_url = fmt.get("url").as_str();
-            if (f_url.empty()) continue;
-            std::string itag = fmt.get("itag").as_str();
-            std::string mime = fmt.get("mimeType").as_str();
-            if (itag == "18") {
-                cached_video_url = f_url;
-                if (cached_audio_url.empty()) cached_audio_url = f_url;
-            } else if (mime.find("audio") != std::string::npos) {
-                cached_audio_url = f_url;
-            }
+    // مطابقة 100% لملف yt-dlp-master/yt_dlp/extractor/youtube/_base.py
+    static const ClientSpec kClients[] = {
+        {
+            "VISIONOS",
+            "1.02",
+            "101",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+            "\"deviceMake\":\"Apple\",\"deviceModel\":\"RealityDevice17,1\",\"osName\":\"visionOS\",\"osVersion\":\"26.5.23O471\","
+        },
+        {
+            "IOS",
+            "21.02.3",
+            "5",
+            "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+            "\"deviceMake\":\"Apple\",\"deviceModel\":\"iPhone16,2\",\"osName\":\"iPhone\",\"osVersion\":\"18.3.2.22D82\","
+        },
+        {
+            "TVHTML5_SIMPLY",
+            "1.0",
+            "75",
+            "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+            ""
         }
     };
-    scan_formats(sd.get("formats"));
-    scan_formats(sd.get("adaptiveFormats"));
 
-    TrackDetails td;
-    td.title = title;
-    td.vidid = v_id;
-    td.link = base_url + v_id;
-    td.duration_sec = secs;
-    td.duration_min = duration_min;
-    td.thumb = "https://i.ytimg.com/vi/" + v_id + "/hqdefault.jpg";
+    std::optional<TrackDetails> best_td;
 
-    {
-        std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
-        g_meta_cache[v_id] = {td, now + CACHE_TTL_SEC};
-        if (!cached_video_url.empty()) {
-            g_url_cache[v_id + ":v"] = {cached_video_url, now + CACHE_TTL_SEC};
+    for (const auto& cl : kClients) {
+        std::string vd_field = visitor_data.empty() ? "" : ("\"visitorData\":\"" + json_escape(visitor_data) + "\",");
+        std::string payload =
+            "{\"context\":{\"client\":{"
+            "\"clientName\":\"" + std::string(cl.name) + "\","
+            "\"clientVersion\":\"" + std::string(cl.version) + "\","
+            "\"userAgent\":\"" + std::string(cl.ua) + "\"," +
+            std::string(cl.extra_json) +
+            vd_field +
+            "\"hl\":\"en\","
+            "\"gl\":\"US\","
+            "\"timeZone\":\"UTC\","
+            "\"utcOffsetMinutes\":0"
+            "}},\"videoId\":\"" + json_escape(vid) + "\","
+            "\"playbackContext\":{\"contentPlaybackContext\":{\"html5Preference\":\"HTML5_PREF_WANTS\"}},"
+            "\"contentCheckOk\":true,\"racyCheckOk\":true}";
+
+        std::string visitor_hdr = visitor_data.empty() ? "" : ("-H " + shell_quote("X-Goog-Visitor-Id: " + visitor_data) + " ");
+
+        std::string cmd =
+            "curl -4 -sS --max-time 5 --connect-timeout 2 "
+            "-X POST 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false' "
+            "-H 'Content-Type: application/json' "
+            "-H " + shell_quote(std::string("User-Agent: ") + cl.ua) + " "
+            "-H 'X-YouTube-Client-Name: " + std::string(cl.id) + "' "
+            "-H 'X-YouTube-Client-Version: " + std::string(cl.version) + "' " +
+            visitor_hdr +
+            "-H 'Origin: https://www.youtube.com' "
+            "--data-raw " + shell_quote(payload) + " 2>/dev/null";
+
+        auto [out, rc] = core::run_shell_command(cmd);
+        if (rc != 0 || out.empty()) continue;
+
+        JsonVal root = JsonParser(out).parse_value();
+        std::string new_vd = root.get("responseContext").get("visitorData").as_str();
+        if (!new_vd.empty() && visitor_data.empty()) {
+            visitor_data = new_vd;
+            std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
+            g_visitor_data = new_vd;
+            g_visitor_data_exp = now + 7200;
         }
+
+        const JsonVal& vd = root.get("videoDetails");
+        std::string title = vd.get("title").as_str();
+        if (title.empty()) continue;
+
+        std::string v_id = vd.get("videoId").as_str(vid);
+        int secs = static_cast<int>(vd.get("lengthSeconds").as_int(0));
+        bool is_live = vd.get("isLive").as_bool(false) || (vd.get("isLiveContent").as_bool(false) && secs == 0);
+        std::string duration_min = is_live ? "Live" : sec_to_min_str(secs);
+
+        const JsonVal& sd = root.get("streamingData");
+        std::string cached_audio_url;
+        std::string cached_video_url;
+
+        auto scan_formats = [&](const JsonVal& arr_val) {
+            if (arr_val.type != JsonVal::Array) return;
+            for (const auto& fmt : arr_val.arr) {
+                std::string f_url = fmt.get("url").as_str();
+                if (f_url.empty()) continue;
+                std::string itag = fmt.get("itag").as_str();
+                std::string mime = fmt.get("mimeType").as_str();
+                if (itag == "18" || itag == "22") {
+                    cached_video_url = f_url;
+                    if (cached_audio_url.empty()) cached_audio_url = f_url;
+                } else if (itag == "140" || mime.find("audio/mp4") != std::string::npos) {
+                    cached_audio_url = f_url;
+                } else if (mime.find("audio") != std::string::npos && cached_audio_url.empty()) {
+                    cached_audio_url = f_url;
+                }
+            }
+        };
+        scan_formats(sd.get("formats"));
+        scan_formats(sd.get("adaptiveFormats"));
+
+        std::string hls_url = sd.get("hlsManifestUrl").as_str();
+        if (!hls_url.empty()) {
+            if (cached_audio_url.empty()) cached_audio_url = hls_url;
+            if (cached_video_url.empty()) cached_video_url = hls_url;
+        }
+
+        TrackDetails td;
+        td.title = title;
+        td.vidid = v_id;
+        td.link = base_url + v_id;
+        td.duration_sec = secs;
+        td.duration_min = duration_min;
+        td.thumb = "https://i.ytimg.com/vi/" + v_id + "/hqdefault.jpg";
+
+        {
+            std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
+            g_meta_cache[v_id] = {td, now + CACHE_TTL_SEC};
+            if (!cached_video_url.empty()) {
+                g_url_cache[v_id + ":v"] = {cached_video_url, now + CACHE_TTL_SEC};
+            }
+            if (!cached_audio_url.empty()) {
+                g_url_cache[v_id + ":a"] = {cached_audio_url, now + CACHE_TTL_SEC};
+            }
+        }
+
+        best_td = td;
         if (!cached_audio_url.empty()) {
-            g_url_cache[v_id + ":a"] = {cached_audio_url, now + CACHE_TTL_SEC};
+            LOGGER("AnnieXMedia.platforms.Youtube").info(
+                std::string("✅ Innertube ") + cl.name + " resolved direct stream URL (" +
+                std::to_string(cached_audio_url.size()) + " chars)"
+            );
+            return td;
         }
     }
 
-    return td;
+    return best_td;
 }
 
+// ---------------------------------------------------------------------------
+// 2. innertube_search: بحث مباشر عبر IPv4 في 100ms مع حفظ visitorData
+// ---------------------------------------------------------------------------
 std::vector<TrackDetails> innertube_search(const std::string& query, int limit, const std::string& base_url) {
     std::vector<TrackDetails> results;
     if (query.empty()) return results;
@@ -442,6 +554,13 @@ std::vector<TrackDetails> innertube_search(const std::string& query, int limit, 
     if (rc != 0 || out.empty()) return results;
 
     JsonVal root = JsonParser(out).parse_value();
+    std::string vd = root.get("responseContext").get("visitorData").as_str();
+    if (!vd.empty()) {
+        std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
+        g_visitor_data = vd;
+        g_visitor_data_exp = now_epoch() + 7200;
+    }
+
     const JsonVal& sections = root.get("contents")
         .get("twoColumnSearchResultsRenderer")
         .get("primaryContents")
@@ -510,10 +629,10 @@ TrackDetails YouTubeAPI::track(const std::string& query_or_link, bool is_videoid
     std::string vid = extract_vid(query_or_link, is_videoid);
 
     if (is_valid_vidid(vid)) {
-        LOGGER("AnnieXMedia.platforms.Youtube").info("⚡ Fast Innertube Player lookup (cookie-free IPv4) for videoId: " + vid);
+        LOGGER("AnnieXMedia.platforms.Youtube").info("⚡ Fast Innertube Player lookup (VISIONOS IPv4) for videoId: " + vid);
         if (auto info = innertube_player(vid, base)) {
             LOGGER("AnnieXMedia.platforms.Youtube").info(
-                "✅ YouTube track found (Innertube Player): title=[" + info->title + "] id=[" + info->vidid + "] duration=[" + info->duration_min + "]"
+                "✅ YouTube track found (Innertube VISIONOS): title=[" + info->title + "] id=[" + info->vidid + "] duration=[" + info->duration_min + "]"
             );
             return *info;
         }
@@ -523,7 +642,7 @@ TrackDetails YouTubeAPI::track(const std::string& query_or_link, bool is_videoid
     while (!query.empty() && std::isspace(static_cast<unsigned char>(query.front()))) query.erase(query.begin());
     while (!query.empty() && std::isspace(static_cast<unsigned char>(query.back()))) query.pop_back();
 
-    LOGGER("AnnieXMedia.platforms.Youtube").info("🔎 Fast Innertube Search (cookie-free IPv4) for query: " + query);
+    LOGGER("AnnieXMedia.platforms.Youtube").info("🔎 Fast Innertube Search (IPv4) for query: " + query);
     auto results = innertube_search(query, 1, base);
     if (!results.empty()) {
         TrackDetails first = results.front();
@@ -541,7 +660,7 @@ TrackDetails YouTubeAPI::track(const std::string& query_or_link, bool is_videoid
     std::string target = is_valid_vidid(vid) ? (base + vid) : ("ytsearch1:" + query);
     std::string cmd =
         "yt-dlp --no-cookies --force-ipv4 --source-address 0.0.0.0 --no-warnings --no-check-certificates --flat-playlist "
-        "--extractor-args \"youtube:player_client=visionos,android;player_skip=webpage,configs,initial_data,js;fetch_pot=never\" "
+        "--extractor-args \"youtube:player_client=visionos,ios,tv_simply;player_skip=configs,initial_data;fetch_pot=never\" "
         "--print \"%(id)s\t%(title)s\t%(duration)s\t%(webpage_url)s\t%(thumbnail)s\" " +
         shell_quote(target) + " 2>&1";
 
@@ -602,7 +721,7 @@ std::string YouTubeAPI::get_direct_link(const std::string& link, bool prefer_aud
         auto it = g_url_cache.find(cache_key);
         if (it != g_url_cache.end() && it->second.second > now && !it->second.first.empty()) {
             LOGGER("AnnieXMedia.platforms.Youtube").info(
-                "✅ Extracted direct YouTube URL via Innertube VISIONOS (cookie-free, " +
+                "✅ Extracted direct YouTube URL via Innertube VISIONOS/IOS (" +
                 std::to_string(it->second.first.size()) + " chars)"
             );
             return it->second.first;
@@ -610,8 +729,8 @@ std::string YouTubeAPI::get_direct_link(const std::string& link, bool prefer_aud
     }
 
     std::string media_format = is_video
-        ? "best[ext=mp4][height<=720]/best[height<=720]/best"
-        : "bestaudio[ext=m4a]/bestaudio/best";
+        ? "best[ext=mp4][height<=720]/best[height<=720]/18/best"
+        : "bestaudio[ext=m4a]/bestaudio/18/best";
 
     auto extract_first_http_url = [prefer_audio](const std::string& output) -> std::string {
         std::stringstream ss(output);
@@ -629,20 +748,25 @@ std::string YouTubeAPI::get_direct_link(const std::string& link, bool prefer_aud
         return chosen;
     };
 
+    std::string vd = get_or_fetch_visitor_data();
+    std::string vd_arg = vd.empty() ? "" : (";visitor_data=" + vd);
+
+    // ملاحظة هامة من فحص yt-dlp (_video.py سطر 3568):
+    // لا نضع js في player_skip ولا نحذف hls/dash حتى لا يتجاهل yt-dlp روابط البث التي تحتوي على &n= أو m3u8
     std::string fast_cmd =
         "yt-dlp --no-cookies --force-ipv4 --source-address 0.0.0.0 --no-warnings --no-check-certificates "
-        "--no-playlist --socket-timeout 5 --retries 2 --cache-dir /tmp/ytdlp_cache "
-        "--extractor-args \"youtube:player_client=visionos,android;player_skip=webpage,configs,initial_data,js;skip=hls,dash,translated_subs;formats=missing_pot;fetch_pot=never\" "
+        "--no-playlist --socket-timeout 6 --retries 2 --cache-dir /tmp/ytdlp_cache "
+        "--extractor-args \"youtube:player_client=visionos,ios,tv_simply;player_skip=configs,initial_data;formats=missing_pot;fetch_pot=never" + vd_arg + "\" "
         "-g -f \"" + media_format + "\" " + shell_quote(target_url) + " 2>&1";
 
-    LOGGER("AnnieXMedia.platforms.Youtube").info("🔗 Pulling direct YouTube stream URL (cookie-free fast_opts): " + fast_cmd);
+    LOGGER("AnnieXMedia.platforms.Youtube").info("🔗 Pulling direct YouTube stream URL (visionos fast_opts): " + fast_cmd);
     auto [fast_out, fast_rc] = core::run_shell_command(fast_cmd);
     std::string direct_url = extract_first_http_url(fast_out);
     if (!direct_url.empty()) {
         std::lock_guard<std::mutex> lk(g_yt_cache_mtx);
         g_url_cache[cache_key] = {direct_url, now + CACHE_TTL_SEC};
         LOGGER("AnnieXMedia.platforms.Youtube").info(
-            "✅ Successfully extracted direct YouTube URL via fast_opts (" + std::to_string(direct_url.size()) + " chars)"
+            "✅ Successfully extracted direct YouTube URL via visionos fast_opts (" + std::to_string(direct_url.size()) + " chars)"
         );
         return direct_url;
     }
@@ -650,11 +774,10 @@ std::string YouTubeAPI::get_direct_link(const std::string& link, bool prefer_aud
     std::string fb_cmd =
         "yt-dlp --no-cookies --force-ipv4 --source-address 0.0.0.0 --no-warnings --no-check-certificates "
         "--no-playlist --cache-dir /tmp/ytdlp_cache "
-        "--remote-components ejs:github "
-        "--extractor-args \"youtube:player_client=tv_samsung,web_embedded;player_skip=webpage,initial_data;skip=translated_subs;fetch_pot=never\" "
+        "--extractor-args \"youtube:player_client=visionos,tv_simply,web_embedded,mweb;formats=missing_pot;fetch_pot=never" + vd_arg + "\" "
         "-g -f \"" + media_format + "\" " + shell_quote(target_url) + " 2>&1";
 
-    LOGGER("AnnieXMedia.platforms.Youtube").info("🔄 Trying fallback_opts (tv_samsung,web_embedded cookie-free): " + fb_cmd);
+    LOGGER("AnnieXMedia.platforms.Youtube").info("🔄 Trying fallback_opts (visionos,tv_simply,web_embedded): " + fb_cmd);
     auto [fb_out, fb_rc] = core::run_shell_command(fb_cmd);
     direct_url = extract_first_http_url(fb_out);
     if (!direct_url.empty()) {
@@ -680,9 +803,27 @@ std::string YouTubeAPI::download(const std::string& query_or_link, bool is_video
     std::string target = is_valid_vidid(vid) ? (base + vid) : query_or_link;
     if (!is_valid_vidid(vid) && !exists(target) && target.rfind("http", 0) != 0) {
         auto td = track(target, false);
+        vid = td.vidid;
         target = td.link;
     }
-    return get_direct_link(target, !is_video);
+    std::filesystem::create_directories(config::DOWNLOAD_PATH);
+    std::string ext = is_video ? ".mp4" : ".m4a";
+    std::string out_file = config::DOWNLOAD_PATH + "/" + (is_valid_vidid(vid) ? vid : std::to_string(now_epoch())) + ext;
+    if (std::filesystem::exists(out_file) && std::filesystem::file_size(out_file) > 1024) {
+        return out_file;
+    }
+    std::string direct = get_direct_link(target, !is_video);
+    if (!direct.empty()) {
+        std::string ff_cmd = is_video
+            ? ("ffmpeg -y -nostdin -hide_banner -loglevel error -i " + shell_quote(direct) + " -c copy " + shell_quote(out_file))
+            : ("ffmpeg -y -nostdin -hide_banner -loglevel error -i " + shell_quote(direct) + " -vn -c:a aac -b:a 128k " + shell_quote(out_file));
+        auto [ff_out, ff_rc] = core::run_shell_command(ff_cmd);
+        (void)ff_out;
+        if (ff_rc == 0 && std::filesystem::exists(out_file) && std::filesystem::file_size(out_file) > 1024) {
+            return out_file;
+        }
+    }
+    return direct;
 }
 
 std::vector<TrackDetails> YouTubeAPI::playlist(const std::string& link, int limit) {
