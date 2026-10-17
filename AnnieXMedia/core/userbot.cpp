@@ -1,13 +1,18 @@
 #include "AnnieXMedia/core/userbot.hpp"
 #include "AnnieXMedia/core/bot.hpp"
 #include "AnnieXMedia/logging.hpp"
+#include "AnnieXMedia/misc.hpp"
 #include "config.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <regex>
+#include <unordered_map>
 
 namespace AnnieXMedia::core {
 
@@ -15,8 +20,97 @@ std::vector<int> assistants;
 std::vector<int64_t> assistantids;
 Userbot userbot;
 
+namespace {
+
+std::mutex g_auth_state_mtx;
+std::unordered_map<int, int32_t> g_assistant_auth_state;
+std::once_flag g_login_handler_once;
+
+std::string shell_quote_arg(const std::string& arg) {
+    std::string out = "'";
+    for (char c : arg) {
+        if (c == '\'') out += "'\\''";
+        else out.push_back(c);
+    }
+    out += "'";
+    return out;
+}
+
+void run_session_sync(const std::string& action, int index, const std::string& phone_hint = "") {
+    if (!config::MONGO_DB_URI.empty()) {
+        setenv("MONGO_DB_URI", config::MONGO_DB_URI.c_str(), 1);
+    }
+    std::string cmd = "python3 /usr/local/bin/td_session_sync.py " +
+                      shell_quote_arg(action) + " " +
+                      std::to_string(index) + " " +
+                      shell_quote_arg(phone_hint);
+    int rc = std::system(cmd.c_str());
+    (void)rc;
+}
+
+std::string normalize_arabic_digits(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == 0xD9 && i + 1 < s.size()) {
+            unsigned char n = static_cast<unsigned char>(s[i + 1]);
+            if (n >= 0xA0 && n <= 0xA9) {
+                out.push_back(static_cast<char>('0' + (n - 0xA0)));
+                ++i;
+                continue;
+            }
+        } else if (c == 0xDB && i + 1 < s.size()) {
+            unsigned char n = static_cast<unsigned char>(s[i + 1]);
+            if (n >= 0xB0 && n <= 0xB9) {
+                out.push_back(static_cast<char>('0' + (n - 0xB0)));
+                ++i;
+                continue;
+            }
+        }
+        out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
+std::string trim_str(std::string s) {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+    return s;
+}
+
+std::shared_ptr<AssistantClient> find_waiting_assistant(int32_t expected_state_id, int preferred_idx = 0) {
+    if (preferred_idx >= 1 && preferred_idx <= 5) {
+        auto c = userbot.get_by_index(preferred_idx);
+        if (c) return c;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_auth_state_mtx);
+        for (int idx = 1; idx <= 5; ++idx) {
+            if (g_assistant_auth_state[idx] == expected_state_id) {
+                auto c = userbot.get_by_index(idx);
+                if (c) return c;
+            }
+        }
+    }
+    for (int idx = 1; idx <= 5; ++idx) {
+        auto c = userbot.get_by_index(idx);
+        if (c && !c->is_authorized()) return c;
+    }
+    return userbot.one;
+}
+
+} // namespace
+
 AssistantClient::AssistantClient(int index, std::string session_config)
     : index_(index), session_config_(std::move(session_config)) {
+    std::string phone_env = config::getenv_str(("ASSISTANT_PHONE" + std::to_string(index_)).c_str(), "");
+    if (phone_env.empty() && !session_config_.empty() && (session_config_[0] == '+' || std::isdigit(static_cast<unsigned char>(session_config_[0])))) {
+        phone_env = session_config_;
+    }
+    // استرجاع جلسة المساعد المحفوظة في MongoDB قبل بدء TDLib لمنع طلب الكود بعد كل Deploy
+    run_session_sync("restore", index_, phone_env);
+
     td::ClientManager::execute(td_api::make_object<td_api::setLogVerbosityLevel>(0));
     client_manager_ = std::make_unique<td::ClientManager>();
     client_id_ = client_manager_->create_client_id();
@@ -50,7 +144,13 @@ td_api::object_ptr<td_api::Object> AssistantClient::send_query_sync(td_api::obje
 
 void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationState> state) {
     if (!state) return;
-    switch (state->get_id()) {
+    int32_t st_id = state->get_id();
+    {
+        std::lock_guard<std::mutex> lk(g_auth_state_mtx);
+        g_assistant_auth_state[index_] = st_id;
+    }
+
+    switch (st_id) {
         case td_api::authorizationStateWaitTdlibParameters::ID: {
             std::string db_dir = "td_db/assistant_" + std::to_string(index_);
             std::filesystem::create_directories(db_dir);
@@ -84,11 +184,14 @@ void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationStat
                                if (obj && obj->get_id() == td_api::error::ID) {
                                    auto* err = static_cast<const td_api::error*>(obj.get());
                                    LOGGER("AnnieXMedia.core.userbot").error("❌ فشل إرسال رقم المساعد " + std::to_string(index_) + ": " + err->message_);
+                                   if (config::LOGGER_ID != 0) {
+                                       app.send_message(config::LOGGER_ID, "❌ <b>فشل إرسال رقم هاتف المساعد " + std::to_string(index_) + ":</b>\n<code>" + err->message_ + "</code>");
+                                   }
                                }
                            });
             } else {
                 LOGGER("AnnieXMedia.core.userbot").warning(
-                    "📲 المساعد " + std::to_string(index_) + " بانتظار رقم الهاتف! أرسل في خاص البوت: رقم المساعد +201xxxxxxxxx"
+                    "📲 المساعد " + std::to_string(index_) + " بانتظار رقم الهاتف! أرسل في خاص البوت أو جروب السجل: رقم المساعد +201xxxxxxxxx"
                 );
             }
             break;
@@ -101,12 +204,17 @@ void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationStat
                 LOGGER("AnnieXMedia.core.userbot").warning(
                     "📲 المساعد " + std::to_string(index_) + " بانتظار كود التفعيل! أرسل الكود الآن في جروب السجل أو في خاص البوت: كود المساعد 1 2 3 4 5"
                 );
-                app.send_message(
-                    config::OWNER_ID,
+                std::string prompt_msg =
                     "📲 <b>المساعد " + std::to_string(index_) + " بانتظار كود التفعيل!</b>\n"
-                    "أرسل الكود الآن هنا في الشات مفصولاً بمسافات هكذا:\n"
-                    "<code>كود المساعد 1 2 3 4 5</code>"
-                );
+                    "أرسل الكود الآن هنا في الشات (أو في جروب السجل) مفصولاً بمسافات هكذا:\n"
+                    "<code>كود المساعد 1 2 3 4 5</code>\n\n"
+                    "💡 أو أرسل الأرقام الـ 5 مباشرة، ولإعادة إرسال الكود عبر SMS أرسل: <code>طلب كود</code>";
+                if (config::LOGGER_ID != 0) {
+                    app.send_message(config::LOGGER_ID, prompt_msg);
+                }
+                if (config::OWNER_ID != 0) {
+                    app.send_message(config::OWNER_ID, prompt_msg);
+                }
             }
             break;
         }
@@ -118,12 +226,16 @@ void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationStat
                 LOGGER("AnnieXMedia.core.userbot").warning(
                     "🔐 المساعد " + std::to_string(index_) + " محمي بكلمة مرور التحقق بخطوتين (2FA)! بانتظار إدخال الباسورد في شات البوت..."
                 );
-                app.send_message(
-                    config::OWNER_ID,
+                std::string pass_msg =
                     "🔐 <b>حساب المساعد " + std::to_string(index_) + " محمي بكلمة مرور التحقق بخطوتين (2FA)!</b>\n"
-                    "أرسل كلمة المرور الآن هنا في الشات هكذا:\n"
-                    "<code>باسورد المساعد كلمه_السر</code>"
-                );
+                    "أرسل كلمة المرور الآن هنا في الشات أو في جروب السجل هكذا:\n"
+                    "<code>باسورد المساعد كلمه_السر</code>";
+                if (config::LOGGER_ID != 0) {
+                    app.send_message(config::LOGGER_ID, pass_msg);
+                }
+                if (config::OWNER_ID != 0) {
+                    app.send_message(config::OWNER_ID, pass_msg);
+                }
             }
             break;
         }
@@ -151,21 +263,48 @@ void AssistantClient::on_auth_state(td_api::object_ptr<td_api::AuthorizationStat
                         );
 
                         this->send_query_sync(td_api::make_object<td_api::getChats>(nullptr, 100), 6);
+
+                        std::string phone_env = config::getenv_str(("ASSISTANT_PHONE" + std::to_string(index_)).c_str(), "");
+                        if (phone_env.empty() && !session_config_.empty() && (session_config_[0] == '+' || std::isdigit(static_cast<unsigned char>(session_config_[0])))) {
+                            phone_env = session_config_;
+                        }
+                        // حفظ جلسة المساعد فوراً في MongoDB
+                        run_session_sync("backup", index_, phone_env);
+
+                        // التأكد من تعرف TDLib على جروب السجل وانضمام المساعد إليه قبل إرسال الرسالة
+                        if (config::LOGGER_ID != 0) {
+                            auto log_chat = this->send_query_sync(td_api::make_object<td_api::getChat>(config::LOGGER_ID), 4);
+                            if (!log_chat || log_chat->get_id() != td_api::chat::ID) {
+                                std::string inv = app.export_chat_invite_link(config::LOGGER_ID);
+                                if (!inv.empty()) {
+                                    (void)this->send_query_sync(td_api::make_object<td_api::checkChatInviteLink>(inv), 5);
+                                    (void)this->send_query_sync(td_api::make_object<td_api::joinChatByInviteLink>(inv), 5);
+                                    (void)this->send_query_sync(td_api::make_object<td_api::getChat>(config::LOGGER_ID), 4);
+                                }
+                            }
+                            app.unmute_chat_member(config::LOGGER_ID, this->id);
+                        }
+
                         std::string start_text = "☔ تم بدء تشغيل الحساب المساعد " + std::to_string(index_) +
                                                  " بنجاح بهوية: " + this->name + " (@" + this->username + ")";
+                        std::string bot_confirm =
+                            "✅ <b>تم تشغيل الحساب المساعد " + std::to_string(index_) + " وحفظ جلسته بنجاح!</b>\n"
+                            "• الاسم: " + this->name + "\n"
+                            "• اليوزر: @" + this->username + "\n"
+                            "• الآيدي: <code>" + std::to_string(this->id) + "</code>";
+
                         if (config::LOGGER_ID != 0) {
                             this->send_message(config::LOGGER_ID, start_text);
+                            app.send_message(config::LOGGER_ID, bot_confirm);
                         }
                         if (config::OWNER_ID != 0) {
                             this->send_message(config::OWNER_ID, start_text);
-                            app.send_message(
-                                config::OWNER_ID,
-                                "✅ <b>تم تشغيل الحساب المساعد " + std::to_string(index_) + " بنجاح!</b>\n"
-                                "• الاسم: " + this->name + "\n"
-                                "• اليوزر: @" + this->username + "\n"
-                                "• الآيدي: <code>" + std::to_string(this->id) + "</code>"
-                            );
+                            app.send_message(config::OWNER_ID, bot_confirm);
                         }
+
+                        // نسخة احتياطية ثانية بعد 4 ثوانٍ لضمان كتابة جميع صفحات td.binlog على القرص
+                        std::this_thread::sleep_for(std::chrono::seconds(4));
+                        run_session_sync("backup", index_, phone_env);
                     }
                 }).detach();
             }
@@ -215,12 +354,21 @@ bool AssistantClient::start() {
         }
     });
 
-    for (int i = 0; i < 50 && !authorized_.load(); ++i) {
+    for (int i = 0; i < 40 && !authorized_.load(); ++i) {
+        {
+            std::lock_guard<std::mutex> lk(g_auth_state_mtx);
+            int32_t st = g_assistant_auth_state[index_];
+            if (st == td_api::authorizationStateWaitCode::ID || st == td_api::authorizationStateWaitPassword::ID) {
+                break;
+            }
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     if (!authorized_.load()) {
-        assistants.push_back(index_);
+        if (std::find(assistants.begin(), assistants.end(), index_) == assistants.end()) {
+            assistants.push_back(index_);
+        }
         LOGGER("AnnieXMedia.core.userbot").info(
             "⏳ المساعد " + std::to_string(index_) + " ينتظر إدخال كود التفعيل من تيليجرام (أرسل الكود في شات البوت أو جروب السجل بدون عمل Deploy)..."
         );
@@ -230,8 +378,11 @@ bool AssistantClient::start() {
 
 void AssistantClient::stop() {
     if (!running_.exchange(false)) return;
-    send_query(td_api::make_object<td_api::close>());
+    send_query_sync(td_api::make_object<td_api::close>(), 3);
     if (worker_.joinable()) worker_.join();
+    if (authorized_.load()) {
+        run_session_sync("backup", index_, session_config_);
+    }
 }
 
 int32_t AssistantClient::get_or_create_group_call_id(int64_t chat_id, bool auto_create) {
@@ -364,11 +515,14 @@ std::vector<int64_t> AssistantClient::get_call_participants(int64_t chat_id) {
 }
 
 bool AssistantClient::join_chat_by_link_or_username(const std::string& link_or_username) {
-    if (link_or_username.find("t.me/") != std::string::npos || link_or_username.find("http") != std::string::npos) {
+    if (link_or_username.find("t.me/+") != std::string::npos || link_or_username.find("joinchat/") != std::string::npos || link_or_username.find("http") != std::string::npos) {
+        (void)send_query_sync(td_api::make_object<td_api::checkChatInviteLink>(link_or_username), 5);
         auto r = send_query_sync(td_api::make_object<td_api::joinChatByInviteLink>(link_or_username), 8);
         return r && r->get_id() == td_api::chat::ID;
     }
     std::string clean = link_or_username;
+    auto slash = clean.rfind('/');
+    if (slash != std::string::npos) clean = clean.substr(slash + 1);
     if (!clean.empty() && clean[0] == '@') clean.erase(clean.begin());
     auto pub = send_query_sync(td_api::make_object<td_api::searchPublicChat>(clean), 8);
     if (pub && pub->get_id() == td_api::chat::ID) {
@@ -387,6 +541,15 @@ bool AssistantClient::leave_chat(int64_t chat_id) {
 void AssistantClient::send_message(int64_t chat_id, const std::string& text) {
     if (chat_id > 0) {
         send_query_sync(td_api::make_object<td_api::createPrivateChat>(chat_id, false), 3);
+    } else if (chat_id < 0) {
+        auto c_obj = send_query_sync(td_api::make_object<td_api::getChat>(chat_id), 3);
+        if (!c_obj || c_obj->get_id() != td_api::chat::ID) {
+            std::string inv = app.export_chat_invite_link(chat_id);
+            if (!inv.empty()) {
+                (void)send_query_sync(td_api::make_object<td_api::checkChatInviteLink>(inv), 4);
+                (void)send_query_sync(td_api::make_object<td_api::joinChatByInviteLink>(inv), 4);
+            }
+        }
     }
     auto req = td_api::make_object<td_api::sendMessage>();
     req->chat_id_ = chat_id;
@@ -407,6 +570,176 @@ Userbot::Userbot() = default;
 
 void Userbot::start() {
     LOGGER("AnnieXMedia.core.userbot").info("💝 جارٍ بدء تشغيل حسابات المساعدين (TDLib Native)...");
+
+    // تسجيل معالج رسائل مباشر في البوت لاستلام كود التفعيل وباسورد 2FA ورقم المساعد من الخاص أو جروب السجل
+    std::call_once(g_login_handler_once, []() {
+        app.on_message([](const IncomingMessage& msg) -> bool {
+            if (msg.text.empty()) return false;
+
+            std::string norm = trim_str(normalize_arabic_digits(msg.text));
+            if (norm.empty()) return false;
+
+            bool any_waiting_auth = false;
+            {
+                std::lock_guard<std::mutex> lk(g_auth_state_mtx);
+                for (int idx = 1; idx <= 5; ++idx) {
+                    int32_t st = g_assistant_auth_state[idx];
+                    if (st == td_api::authorizationStateWaitCode::ID ||
+                        st == td_api::authorizationStateWaitPassword::ID ||
+                        st == td_api::authorizationStateWaitPhoneNumber::ID) {
+                        any_waiting_auth = true;
+                        break;
+                    }
+                }
+            }
+
+            bool is_allowed_user = any_waiting_auth ||
+                                   msg.is_private ||
+                                   (msg.sender_user_id == config::OWNER_ID) ||
+                                   AnnieXMedia::is_sudo(msg.sender_user_id) ||
+                                   (config::LOGGER_ID != 0 && msg.chat_id == config::LOGGER_ID);
+            if (!is_allowed_user) return false;
+
+            // 1. إعادة إرسال الكود: "طلب كود" أو "اعادة ارسال الكود" أو "/resend"
+            if (norm == "طلب كود" || norm == "اعادة ارسال الكود" || norm == "إعادة إرسال الكود" || norm == "/resend") {
+                auto ass = find_waiting_assistant(td_api::authorizationStateWaitCode::ID);
+                if (!ass) {
+                    app.send_message(msg.chat_id, "⚠️ لا يوجد حساب مساعد مضاف حالياً.", {}, msg.id);
+                    return true;
+                }
+                ass->send_query(td_api::make_object<td_api::resendAuthenticationCode>(nullptr),
+                                [chat_id = msg.chat_id, msg_id = msg.id](td_api::object_ptr<td_api::Object> obj) {
+                                    if (obj && obj->get_id() == td_api::error::ID) {
+                                        auto* err = static_cast<const td_api::error*>(obj.get());
+                                        app.send_message(chat_id, "❌ تعذر إعادة إرسال الكود: <code>" + err->message_ + "</code>", {}, msg_id);
+                                    } else {
+                                        app.send_message(chat_id, "📲 تم طلب إعادة إرسال كود التفعيل بنجاح! أرسله فور وصوله.", {}, msg_id);
+                                    }
+                                });
+                return true;
+            }
+
+            // 2. إدخال باسورد التحقق بخطوتين (2FA): "باسورد المساعد ..." أو "رمز المساعد ..." أو "/password ..."
+            for (const char* prefix : {"باسورد المساعد", "باسورد", "رمز المساعد", "/password", "/pass"}) {
+                std::string p(prefix);
+                if (norm.rfind(p, 0) == 0 && (norm.size() == p.size() || std::isspace(static_cast<unsigned char>(norm[p.size()])))) {
+                    std::string pass = trim_str(norm.substr(p.size()));
+                    if (pass.empty()) {
+                        app.send_message(msg.chat_id, "⚠️ أرسل الباسورد بعد الأمر هكذا:\n<code>باسورد المساعد كلمه_السر</code>", {}, msg.id);
+                        return true;
+                    }
+                    auto ass = find_waiting_assistant(td_api::authorizationStateWaitPassword::ID);
+                    if (!ass) {
+                        app.send_message(msg.chat_id, "⚠️ لا يوجد مساعد بانتظار كلمة المرور حالياً.", {}, msg.id);
+                        return true;
+                    }
+                    app.send_message(msg.chat_id, "⏳ جارٍ التحقق من كلمة المرور للمساعد...", {}, msg.id);
+                    ass->send_query(td_api::make_object<td_api::checkAuthenticationPassword>(pass),
+                                    [chat_id = msg.chat_id, msg_id = msg.id](td_api::object_ptr<td_api::Object> obj) {
+                                        if (obj && obj->get_id() == td_api::error::ID) {
+                                            auto* err = static_cast<const td_api::error*>(obj.get());
+                                            app.send_message(chat_id, "❌ كلمة المرور غير صحيحة: <code>" + err->message_ + "</code>", {}, msg_id);
+                                        }
+                                    });
+                    return true;
+                }
+            }
+
+            // 3. إدخال رقم الهاتف: "رقم المساعد +201..."
+            for (const char* prefix : {"رقم المساعد", "/phone"}) {
+                std::string p(prefix);
+                if (norm.rfind(p, 0) == 0 && (norm.size() == p.size() || std::isspace(static_cast<unsigned char>(norm[p.size()])))) {
+                    std::string phone = trim_str(norm.substr(p.size()));
+                    if (phone.empty()) {
+                        app.send_message(msg.chat_id, "⚠️ أرسل الرقم مع رمز الدولة هكذا:\n<code>رقم المساعد +201xxxxxxxxx</code>", {}, msg.id);
+                        return true;
+                    }
+                    auto ass = find_waiting_assistant(td_api::authorizationStateWaitPhoneNumber::ID);
+                    if (!ass) ass = userbot.one;
+                    if (!ass) return true;
+                    app.send_message(msg.chat_id, "📲 جارٍ إرسال رقم الهاتف <code>" + phone + "</code> لطلب الكود...", {}, msg.id);
+                    ass->send_query(td_api::make_object<td_api::setAuthenticationPhoneNumber>(phone, nullptr),
+                                    [chat_id = msg.chat_id, msg_id = msg.id](td_api::object_ptr<td_api::Object> obj) {
+                                        if (obj && obj->get_id() == td_api::error::ID) {
+                                            auto* err = static_cast<const td_api::error*>(obj.get());
+                                            app.send_message(chat_id, "❌ خطأ في رقم الهاتف: <code>" + err->message_ + "</code>", {}, msg_id);
+                                        }
+                                    });
+                    return true;
+                }
+            }
+
+            // 4. إدخال كود التفعيل: "كود المساعد 1 2 3 4 5" أو "كود 12345" أو "/code 12345" أو إرسال 5 أرقام مباشرة
+            bool has_code_prefix = false;
+            std::string code_part = norm;
+            for (const char* prefix : {"كود المساعد", "كود", "/code"}) {
+                std::string p(prefix);
+                if (norm.rfind(p, 0) == 0 && (norm.size() == p.size() || std::isspace(static_cast<unsigned char>(norm[p.size()])) || std::isdigit(static_cast<unsigned char>(norm[p.size()])))) {
+                    has_code_prefix = true;
+                    code_part = trim_str(norm.substr(p.size()));
+                    break;
+                }
+            }
+
+            std::string digits;
+            bool only_digits_and_spaces = true;
+            for (unsigned char c : code_part) {
+                if (std::isdigit(c)) {
+                    digits.push_back(static_cast<char>(c));
+                } else if (std::isspace(c) || c == '-' || c == '.') {
+                    continue;
+                } else {
+                    only_digits_and_spaces = false;
+                }
+            }
+
+            if (has_code_prefix || (only_digits_and_spaces && digits.size() == 5 && (any_waiting_auth || msg.is_private || msg.chat_id == config::LOGGER_ID))) {
+                int target_idx = 0;
+                if (digits.size() == 6 && digits[0] >= '1' && digits[0] <= '5') {
+                    target_idx = digits[0] - '0';
+                    digits = digits.substr(1);
+                }
+                if (digits.size() < 4 || digits.size() > 6) {
+                    if (has_code_prefix) {
+                        app.send_message(msg.chat_id, "⚠️ يرجى إرسال كود التفعيل المكون من 5 أرقام هكذا:\n<code>كود المساعد 1 2 3 4 5</code>", {}, msg.id);
+                        return true;
+                    }
+                    return false;
+                }
+
+                auto ass = find_waiting_assistant(td_api::authorizationStateWaitCode::ID, target_idx);
+                if (!ass) {
+                    app.send_message(msg.chat_id, "⚠️ لا يوجد حساب مساعد بانتظار الكود حالياً.", {}, msg.id);
+                    return true;
+                }
+                if (ass->is_authorized()) {
+                    app.send_message(msg.chat_id, "✅ الحساب المساعد مسجل دخول بالفعل وشغال!", {}, msg.id);
+                    return true;
+                }
+
+                LOGGER("AnnieXMedia.core.userbot").info("📲 Submitting authentication code [" + digits + "] to Assistant...");
+                app.send_message(msg.chat_id, "⏳ جارٍ التحقق من كود التفعيل (<code>" + digits + "</code>)...", {}, msg.id);
+                ass->send_query(td_api::make_object<td_api::checkAuthenticationCode>(digits),
+                                [chat_id = msg.chat_id, msg_id = msg.id](td_api::object_ptr<td_api::Object> obj) {
+                                    if (obj && obj->get_id() == td_api::error::ID) {
+                                        auto* err = static_cast<const td_api::error*>(obj.get());
+                                        app.send_message(
+                                            chat_id,
+                                            "❌ <b>رفض تيليجرام كود التفعيل:</b> <code>" + err->message_ + "</code>\n"
+                                            "• إذا انتهت صلاحية الكود أرسل: <code>طلب كود</code>\n"
+                                            "• وتأكد من إرسال الكود مفصولاً بمسافات فور وصوله: <code>كود المساعد 1 2 3 4 5</code>",
+                                            {},
+                                            msg_id
+                                        );
+                                    }
+                                });
+                return true;
+            }
+
+            return false;
+        });
+    });
+
     if (!config::STRING1.empty()) {
         one = std::make_shared<AssistantClient>(1, config::STRING1);
         one->start();
